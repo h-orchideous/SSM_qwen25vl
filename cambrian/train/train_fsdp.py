@@ -43,7 +43,7 @@ from cambrian.train.cambrian_trainer import CambrianTrainer
 
 from cambrian import conversation as conversation_lib
 
-from cambrian.utils import IS_XLA_AVAILABLE, process_video_with_decord, process_video_with_decord_byframe, process_video_with_decord_bytime, process_gif_with_imageio
+from cambrian.utils import IS_XLA_AVAILABLE, process_video_with_decord, process_video_with_decord_byframe, process_video_with_decord_bytime, process_gif_with_imageio, process_video_with_decord_nfp
 from cambrian.mm_utils import tokenizer_image_token, tokenizer_image_token_llama3
 from cambrian.train.wandb_nan_alert_callback import NanInfAlertWandbCallback
 from cambrian.model.language_model.cambrian_qwen2 import CambrianQwenForCausalLM
@@ -110,7 +110,9 @@ class ModelArguments:
     # start_of_vision_sampler_layers: Optional[int] = field(default=16)
     # stride_of_vision_sampler_layers: Optional[int] = field(default=1)
 
-    # NOTE: follow llava-onevision's setups
+    nfp_head: bool = field(default=False)
+    nfp_mse_loss_weight: float = 1.0
+    nfp_cosine_loss_weight: float = 1.0
     si_token_len: int = 729 # token length (without newline) of per subimages for single image (si)
     miv_token_len: int = 196 # token length (without newline) for per subimages for multi images and video (miv)
 
@@ -1273,6 +1275,7 @@ class LazySupervisedDataset(Dataset):
                 self.data_args)
 
         elif has_video:
+            is_nfp_video = dat.get("nfp", False)
             video_file = dat['video']
             video_folder = self.data_args.video_folder
             video_file = os.path.join(video_folder, video_file)
@@ -1299,6 +1302,7 @@ class LazySupervisedDataset(Dataset):
                     else: # for unknown video frames, we assume it is 1FPS
                         avg_fps = 1
 
+                    assert not is_nfp_video, "shareVideoGPTV is not supported for NFP"
                     frame_files = [os.path.join(video_file, f) for f in os.listdir(video_file) if os.path.isfile(os.path.join(video_file, f))]
                     frame_files.sort()  # Ensure the frames are sorted if they are named sequentially
                     
@@ -1337,6 +1341,7 @@ class LazySupervisedDataset(Dataset):
                             print(f"Failed to read frame at path: {frame_path}")
                     video = np.stack(video)
                 elif video_file.endswith(".gif"):
+                    assert not is_nfp_video, "NFP is not supported for gif video currently"
                     if not os.path.exists(video_file):
                         print("File {} not exist!".format(video_file))
                         raise FileNotFoundError
@@ -1348,20 +1353,24 @@ class LazySupervisedDataset(Dataset):
                         print("File {} not exist!".format(video_file))
                         raise FileNotFoundError
 
-                    if 'start_frame' in dat:
-                        start_frame = dat['start_frame']
-                        end_frame = dat['end_frame']
-                        current_observation_frame = dat.get('current_observation_frame', None)
-
-                        video, video_time, frame_time, num_frames_to_sample = process_video_with_decord_byframe(video_file, self.data_args, start_frame, end_frame, current_observation_frame)
-                        if not video.size > 0:
-                            raise ValueError(f"Video {video_file} is empty")
-                    elif 'start' in dat:
-                        start_time = dat['start']
-                        end_time = dat['end']
-                        video, video_time, frame_time, num_frames_to_sample = process_video_with_decord_bytime(video_file, self.data_args, start_time, end_time)
+                    if is_nfp_video:
+                        video = process_video_with_decord_nfp(video_file, self.data_args)
+                        video_time, frame_time, num_frames_to_sample = None, None, None
                     else:
-                        video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
+                        if 'start_frame' in dat:
+                            start_frame = dat['start_frame']
+                            end_frame = dat['end_frame']
+                            current_observation_frame = dat.get('current_observation_frame', None)
+
+                            video, video_time, frame_time, num_frames_to_sample = process_video_with_decord_byframe(video_file, self.data_args, start_frame, end_frame, current_observation_frame)
+                            if not video.size > 0:
+                                raise ValueError(f"Video {video_file} is empty")
+                        elif 'start' in dat:
+                            start_time = dat['start']
+                            end_time = dat['end']
+                            video, video_time, frame_time, num_frames_to_sample = process_video_with_decord_bytime(video_file, self.data_args, start_time, end_time)
+                        else:
+                            video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
             except BaseException as error:
                 logger.warning(f"Error occurs when load video from {video_file}: {error}")
                 import random
@@ -1433,6 +1442,8 @@ class LazySupervisedDataset(Dataset):
 
         final_si_token_indices = torch.arange(self.tokenizer.model_max_length).long()
         final_miv_token_indices = torch.arange(self.tokenizer.model_max_length).long()
+        final_nfp_token_indices = torch.arange(self.tokenizer.model_max_length).long()
+        final_nfp_loss_masks = torch.zeros(self.tokenizer.model_max_length)
 
         # image exist in the data
         if has_image:
@@ -1652,7 +1663,13 @@ class LazySupervisedDataset(Dataset):
 
             pre_img_labels, post_img_labels = labels[:img_token_indices[0]], labels[img_token_indices[0]+1:]
             real_img_labels = torch.zeros((num_real_img_tokens,)).long() + IGNORE_INDEX
-            data_dict['labels'] = torch.cat([pre_img_labels, real_img_labels, post_img_labels])
+
+            if is_nfp_video:
+                # for NFP video, we don't have labels
+                data_dict['labels'] = torch.cat([pre_img_labels, real_img_labels, torch.zeros_like(post_img_labels).long() + IGNORE_INDEX])
+            else:
+                # for non-NFP video, we have labels
+                data_dict['labels'] = torch.cat([pre_img_labels, real_img_labels, post_img_labels])
 
             real_miv_token_indices = torch.zeros(n_imgs, unpadded_feature_h, unpadded_feature_w + 1).long()
             real_miv_token_indices[:, :, -1] = self.tokenizer.model_max_length # for newline token
@@ -1670,6 +1687,15 @@ class LazySupervisedDataset(Dataset):
 
             real_miv_token_indices[:, :, :-1] = miv_token_indices[:, slice_h, slice_w]
             final_miv_token_indices[img_token_indices[0]:img_token_indices[0]+real_miv_token_indices.numel()] = real_miv_token_indices.flatten()
+
+            if is_nfp_video:
+                real_nfp_token_indices = torch.roll(real_miv_token_indices, shifts=-1, dims=0)
+                final_nfp_token_indices[img_token_indices[0]:img_token_indices[0]+real_nfp_token_indices.numel()] = real_nfp_token_indices.flatten()
+
+                nfp_loss_masks = torch.ones_like(real_miv_token_indices)
+                nfp_loss_masks[-1, ...] = 0
+                nfp_loss_masks[..., -1] = 0
+                final_nfp_loss_masks[img_token_indices[0]:img_token_indices[0]+real_miv_token_indices.numel()] = nfp_loss_masks.flatten()
 
         elif self.data_args.is_multimodal:
 
@@ -1692,6 +1718,8 @@ class LazySupervisedDataset(Dataset):
         data_dict['image_size'] = image_size
         data_dict["si_token_indices"] = final_si_token_indices
         data_dict["miv_token_indices"] = final_miv_token_indices
+        data_dict["nfp_token_indices"] = final_nfp_token_indices
+        data_dict["nfp_loss_masks"] = final_nfp_loss_masks
 
         return data_dict
 
@@ -1853,6 +1881,8 @@ class DataCollatorForSupervisedDataset(object):
         
         si_token_indices = [instance["si_token_indices"] for instance in instances]
         miv_token_indices = [instance["miv_token_indices"] for instance in instances]
+        nfp_token_indices = [instance["nfp_token_indices"] for instance in instances]
+        nfp_loss_masks = [instance["nfp_loss_masks"] for instance in instances]
 
         padding_side = self.tokenizer.padding_side
 
@@ -1868,6 +1898,8 @@ class DataCollatorForSupervisedDataset(object):
         attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
         si_token_indices = torch.stack(si_token_indices)
         miv_token_indices = torch.stack(miv_token_indices)
+        nfp_token_indices = torch.stack(nfp_token_indices)
+        nfp_loss_masks = torch.stack(nfp_loss_masks)
 
         batch = dict(
             input_ids=input_ids,
@@ -1875,6 +1907,8 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=attention_mask,
             si_token_indices=si_token_indices,
             miv_token_indices=miv_token_indices,
+            nfp_token_indices=nfp_token_indices,
+            nfp_loss_masks=nfp_loss_masks,
         )
 
         if 'image_aux_list' in instances[0]:

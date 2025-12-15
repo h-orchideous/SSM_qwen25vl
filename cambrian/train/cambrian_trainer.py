@@ -250,11 +250,24 @@ class CambrianTrainer(Trainer):
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
-            self.accelerator.backward(loss)
+            if isinstance(loss, torch.Tensor):
+                self.accelerator.backward(loss)
+            elif isinstance(loss, (tuple, list)):
+                # if loss is a tuple, we assume the first element is the total loss
+                self.accelerator.backward(loss[0])
+            else:
+                raise ValueError(f"Unsupported loss type: {type(loss)}")
+
         selected_module_names = ['vision_tower']
         # if self.args.unfreeze_mm_vision_tower:
         #     reduce_gradients(self.optimizer, self.param_to_name, selected_module_names)
-        return loss.detach() / self.args.gradient_accumulation_steps
+        # return loss.detach() / self.args.gradient_accumulation_steps
+        if isinstance(loss, (tuple, list)):
+            return tuple([_.detach() / self.args.gradient_accumulation_steps for _ in loss])
+        elif isinstance(loss, torch.Tensor):
+            return loss.detach() / self.args.gradient_accumulation_steps
+        else:
+            raise ValueError(f"Unsupported loss type: {type(loss)}")
 
     def create_optimizer(self):
         """
@@ -724,6 +737,61 @@ class CambrianTrainer(Trainer):
 
     def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
+            
+            def step_closure(
+                loss, ntp_loss, nfp_mse_loss, nfp_cosine_loss, learning_rate, mm_vision_tower_lr, global_step,
+            ):
+                loss = loss.detach().item()
+                ntp_loss = ntp_loss.detach().item() if ntp_loss is not None else None
+                nfp_mse_loss = nfp_mse_loss.detach().item() if nfp_mse_loss is not None else None
+                nfp_cosine_loss = nfp_cosine_loss.detach().item() if nfp_cosine_loss is not None else None
+                learning_rate = learning_rate if learning_rate is not None else None
+                mm_vision_tower_lr = mm_vision_tower_lr if mm_vision_tower_lr is not None else None
+                
+                logs = {}
+                logs["loss"] = loss
+                if ntp_loss is not None:
+                    logs["ntp_loss"] = ntp_loss
+                if nfp_mse_loss is not None:
+                    logs["nfp_mse_loss"] = nfp_mse_loss
+                if nfp_cosine_loss is not None:
+                    logs["nfp_cosine_loss"] = nfp_cosine_loss
+                if learning_rate is not None:
+                    logs["learning_rate"] = learning_rate
+                if mm_vision_tower_lr is not None:
+                    logs["mm_vision_tower_lr"] = mm_vision_tower_lr
+                logs["global_step"] = global_step
+                self.log(logs)
+
+            if self.model.config.nfp_head:
+                tr_loss, ntp_loss, nfp_mse_loss, nfp_cosine_loss = tr_loss
+            else:
+                tr_loss, ntp_loss, nfp_mse_loss, nfp_cosine_loss = tr_loss, None, None, None
+
+            learning_rate = self._get_learning_rate()
+            if self.args.unfreeze_mm_vision_tower:
+                mm_vision_tower_lr = self.optimizer.param_groups[2]['lr']
+            else:
+                mm_vision_tower_lr = None
+
+            self._globalstep_last_logged = self.state.global_step
+            self.store_flos()
+
+            xm.add_step_closure(
+                step_closure,
+                (
+                    tr_loss,
+                    ntp_loss,
+                    nfp_mse_loss,
+                    nfp_cosine_loss,
+                    learning_rate,
+                    mm_vision_tower_lr,
+                    self.state.global_step,
+                ),
+                run_async=True,
+            )
+
+            """
             if is_torch_tpu_available():
                 import torch_xla.core.xla_model as xm
                 xm.mark_step()

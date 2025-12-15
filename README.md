@@ -138,7 +138,31 @@ QAs are grouped by: question types (left) and task groups (right).
 
 ## Train
 
-We are working on cleaning and re-organizing our TPU-based training code, please stay tuned!
+### Environment Preparation
+
+Currently, we support training on TPU using TorchXLA. Install `TorchXLA 2.6.0` by the following commands:
+
+```bash
+pip install torch==2.6.0 torchvision==0.21.0 torch_xla==2.6.0
+pip install 'torch_xla[tpu]' -f https://storage.googleapis.com/libtpu-releases/index.html
+pip install 'torch_xla[pallas]' -f https://storage.googleapis.com/jax-releases/jax_nightly_releases.html -f https://storage.googleapis.com/jax-releases/jaxlib_nightly_releases.html
+pip install --upgrade pip
+pip install -e '.[tpu]'
+```
+
+### Data Preparation
+
+Cambrian-S models are trained on top of [`Cambrian-Alignment`](https://huggingface.co/datasets/nyu-visionx/Cambrian-Alignment), [`Cambrian-7M`](https://huggingface.co/datasets/nyu-visionx/Cambrian-10M), [`Cambrian-S-3M`](https://huggingface.co/datasets/nyu-visionx/Cambrian-S-3M), and [`VSI-590K`](https://huggingface.co/datasets/nyu-visionx/VSI-590K) datasets. Please prepare these datasets following their corresponding guidelines.
+
+### Training Scripts
+
+As mentioned in our paper, Cambrian-S models are trained in 4 stages: from vision-language alignment, to general image instruction tuning, and general video instruction tuning, and finally spatial video tuning. For Cambrian-S-LFP model, we modified the 4th stage by involving latent frame prediction objective. We provides sample training scripts in the following:
+
+* [cambrian/scripts/cambrians_7b_s1.sh](cambrian/scripts/cambrians_7b_s1.sh)
+* [cambrian/scripts/cambrians_7b_s2.sh](cambrian/scripts/cambrians_7b_s2.sh)
+* [cambrian/scripts/cambrians_7b_s3.sh](cambrian/scripts/cambrians_7b_s3.sh)
+* [cambrian/scripts/cambrians_7b_s4.sh](cambrian/scripts/cambrians_7b_s4.sh)
+* [cambrian/scripts/cambrians_7b_lfp_s4.sh](cambrian/scripts/cambrians_7b_lfp_s4.sh)
 
 ## Evaluation
 

@@ -50,7 +50,9 @@ class CustomKernel(torch.autograd.Function):
 
         sharded_embeds = torch.cat([sharded_input_embeds, sharded_newline_tokens, sharded_img_embeds], dim=1)
         sharded_embeds = torch.gather(sharded_embeds, 1, sharded_token_indices.unsqueeze(-1).expand(-1, -1, sharded_embeds.size(-1)))
-        output_embeds = xs.disable_manual_sharding(sharded_embeds, ("fsdp", None, None), input_embeds.shape, mesh=xs.get_global_mesh()).global_tensor
+
+        full_output_shape = (input_embeds.shape[0], token_indices.shape[1], input_embeds.shape[2])
+        output_embeds = xs.disable_manual_sharding(sharded_embeds, ("fsdp", None, None), full_output_shape, mesh=xs.get_global_mesh()).global_tensor
 
         ctx.save_for_backward(token_indices)
         return output_embeds
@@ -238,8 +240,9 @@ class CambrianMetaModel:
         self.config.vision_hidden_size = vision_hidden_size
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
-        if hasattr(model_args, 'nfp_head'):
-            self.config.nfp_head = model_args.nfp_head
+        self.config.nfp_head = model_args.nfp_head
+        self.config.nfp_mse_loss_weight = model_args.nfp_mse_loss_weight
+        self.config.nfp_cosine_loss_weight = model_args.nfp_cosine_loss_weight
 
         if getattr(self, 'mm_projector', None) is None:
 
@@ -372,13 +375,14 @@ class CambrianMetaForCausalLM(ABC):
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, newline_token_indices=None, si_token_indices=None, miv_token_indices=None,
+        nfp_token_indices=None, nfp_loss_masks=None,
     ):
         if os.getenv("CAMBRIAN_LAUNCHER", "") == "TORCHXLA_SPMD":
             import torch_xla.distributed.spmd as xs
 
         vision_tower_aux_list = self.get_model().get_vision_tower_aux_list()
         if vision_tower_aux_list is None or images is None or input_ids.shape[1] == 1:
-            return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None, None, None
+            return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None, None, None, None
 
         image_aux_list = [images]
         bs, nimgs_per_sample = input_ids.size(0), images.size(0) // input_ids.size(0)
@@ -428,6 +432,8 @@ class CambrianMetaForCausalLM(ABC):
 
         image_features = apply_sharded_bld2bchw(image_features, (feature_side_len, feature_side_len))
 
+        nfp_tgt_embeds = None
+
         if si_side_len is not None:
             if self.get_model().config.image_aspect_ratio == "pad":
                 nimgs_per_sample_si = 1
@@ -455,8 +461,21 @@ class CambrianMetaForCausalLM(ABC):
                 miv_features = miv_features[:, :input_ids.size(1)].clone()
             input_embeds = apply_custom_kernel(input_embeds, newline_tokens.type_as(input_embeds), miv_features.type_as(input_embeds), miv_token_indices)
 
+        if self.get_model().config.nfp_head:
+            raw_miv_features = image_aux_features_list[0]
+            raw_miv_features = apply_sharded_bld2bchw(raw_miv_features, (feature_side_len, feature_side_len))
+            if miv_side_len != feature_side_len:
+                raw_miv_features = F.interpolate(raw_miv_features.clone(), size=(miv_side_len, miv_side_len), mode="bilinear", align_corners=False).type_as(raw_miv_features)
+            else:
+                raw_miv_features = raw_miv_features.clone()
+            raw_miv_features = apply_sharded_bchw2bld(raw_miv_features, bs, nimgs_per_sample).type_as(input_embeds)
+
+            nfp_tgt_embeds = torch.zeros(input_embeds.size(0), input_embeds.size(1), raw_miv_features.size(2), device=raw_miv_features.device, dtype=raw_miv_features.dtype)
+            pseudo_newline_tokens = torch.zeros(input_embeds.size(0), 1, raw_miv_features.size(2), device=raw_miv_features.device, dtype=raw_miv_features.dtype)
+            nfp_tgt_embeds = apply_custom_kernel(nfp_tgt_embeds, pseudo_newline_tokens, raw_miv_features.type_as(nfp_tgt_embeds), nfp_token_indices)
+
         if IS_XLA_AVAILABLE:
-            return None, position_ids, attention_mask, past_key_values, input_embeds, labels
+            return None, position_ids, attention_mask, past_key_values, input_embeds, labels, nfp_tgt_embeds
         else:
             raise NotImplementedError
 

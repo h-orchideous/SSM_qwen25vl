@@ -44,6 +44,8 @@ def inspect_tensor_sharding(t, **kwargs):
     sharding = torch_xla._XLAC._get_xla_sharding_spec(maybe_unwrap(t))
     return sharding
 
+import random
+
 
 def process_video_with_decord(video_file, data_args):
     vr = VideoReader(video_file, ctx=cpu(0), num_threads=1)
@@ -68,6 +70,22 @@ def process_video_with_decord(video_file, data_args):
     vr.seek(0)
     return video, video_time, frame_time, num_frames_to_sample
 
+def process_video_with_decord_nfp(video_file, data_args):
+
+    vr = VideoReader(video_file, ctx=cpu(0), num_threads=1)
+    total_frame_num = len(vr)
+
+    avg_fps = round(vr.get_avg_fps() / data_args.video_fps)
+    frame_idx = [i for i in range(0, total_frame_num, avg_fps)]
+
+    if data_args.video_max_frames > 0 and len(frame_idx) > data_args.video_max_frames:
+        start_idx = random.randint(0, len(frame_idx) - data_args.video_max_frames)
+        frame_idx = frame_idx[start_idx:start_idx + data_args.video_max_frames]
+
+    video = vr.get_batch(frame_idx).asnumpy()
+    vr.seek(0)
+
+    return video
 
 def process_video_with_decord_byframe(
     video_file, data_args, start_frame, end_frame, current_observation_frame=None

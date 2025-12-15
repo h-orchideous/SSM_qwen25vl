@@ -13,7 +13,7 @@ else
     num_processes=${#devices[@]}
 fi
 
-checkpoint="ShushengYang/Cambrian-S-7B-LFP"
+checkpoint="nyu-visionx/Cambrian-S-7B-LFP"
 
 bash evaluate_all_in_one.sh --model cambrians_vsr --benchmark cambrians_vsr_10mins --num_processes ${num_processes:-1} --num_frames ${NUM_FRAMES:-128} --pretrained $checkpoint --miv_token_len ${MIV_TOKEN_LEN:-64} --si_token_len ${SI_TOKEN_LEN:-729} --sensory_window_size 32 --compression_downsample_ratio 2 --consolidation_method drop_merge --retrieval_topk 32 --enable_visual_feature_caching True --surprise_threshold 0.35 --consolidation_mem_budget 16384
 
