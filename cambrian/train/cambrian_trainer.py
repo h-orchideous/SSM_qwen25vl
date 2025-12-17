@@ -763,7 +763,7 @@ class CambrianTrainer(Trainer):
                 logs["global_step"] = global_step
                 self.log(logs)
 
-            if self.model.config.nfp_head:
+            if hasattr(self.model.config, 'nfp_head') and self.model.config.nfp_head:
                 tr_loss, ntp_loss, nfp_mse_loss, nfp_cosine_loss = tr_loss
             else:
                 tr_loss, ntp_loss, nfp_mse_loss, nfp_cosine_loss = tr_loss, None, None, None

@@ -260,7 +260,7 @@ class CambrianMetaModel:
             for p in self.mm_projector.parameters():
                 p.requires_grad = True
 
-        if self.config.nfp_head:
+        if hasattr(self.config, 'nfp_head') and self.config.nfp_head:
             self.nfp_head = nn.Sequential(
                 nn.Linear(self.config.hidden_size, self.config.hidden_size),
                 nn.GELU(),
@@ -461,7 +461,7 @@ class CambrianMetaForCausalLM(ABC):
                 miv_features = miv_features[:, :input_ids.size(1)].clone()
             input_embeds = apply_custom_kernel(input_embeds, newline_tokens.type_as(input_embeds), miv_features.type_as(input_embeds), miv_token_indices)
 
-        if self.get_model().config.nfp_head:
+        if hasattr(self.get_model().config, 'nfp_head') and self.get_model().config.nfp_head:
             raw_miv_features = image_aux_features_list[0]
             raw_miv_features = apply_sharded_bld2bchw(raw_miv_features, (feature_side_len, feature_side_len))
             if miv_side_len != feature_side_len:

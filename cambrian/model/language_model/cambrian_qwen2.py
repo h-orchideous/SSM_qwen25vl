@@ -357,27 +357,44 @@ class CambrianQwenForCausalLM(Qwen2ForCausalLM, CambrianMetaForCausalLM):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
-            (
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                inputs_embeds,
-                labels,
-                nfp_tgt_embeds,
-            ) = self.prepare_inputs_labels_for_multimodal(
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                labels,
-                images,
-                newline_token_indices=newline_token_indices,
-                si_token_indices=si_token_indices,
-                miv_token_indices=miv_token_indices,
-                nfp_token_indices=nfp_token_indices,
-                nfp_loss_masks=nfp_loss_masks,
-            )
+            if self.training:
+                (
+                    input_ids,
+                    position_ids,
+                    attention_mask,
+                    past_key_values,
+                    inputs_embeds,
+                    labels,
+                    nfp_tgt_embeds,
+                ) = self.prepare_inputs_labels_for_multimodal(
+                    input_ids,
+                    position_ids,
+                    attention_mask,
+                    past_key_values,
+                    labels,
+                    images,
+                    newline_token_indices=newline_token_indices,
+                    si_token_indices=si_token_indices,
+                    miv_token_indices=miv_token_indices,
+                    nfp_token_indices=nfp_token_indices,
+                    nfp_loss_masks=nfp_loss_masks,
+                )
+            else:
+                (
+                    input_ids,
+                    position_ids,
+                    attention_mask,
+                    past_key_values,
+                    inputs_embeds,
+                    labels,
+                ) = self.prepare_inputs_labels_for_multimodal_for_generation(
+                    input_ids,
+                    position_ids,
+                    attention_mask,
+                    past_key_values,
+                    labels,
+                    images,
+                )
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -433,7 +450,7 @@ class CambrianQwenForCausalLM(Qwen2ForCausalLM, CambrianMetaForCausalLM):
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 
-        if self.config.nfp_head:
+        if hasattr(self.config, 'nfp_head') and self.config.nfp_head:
             nfp_outputs = self.model.nfp_head(hidden_states)
             nfp_mse_loss, nfp_cosine_loss = self.nfp_loss(nfp_outputs, nfp_tgt_embeds, nfp_loss_masks)
             nfp_mse_loss = nfp_mse_loss * self.config.nfp_mse_loss_weight
@@ -456,7 +473,7 @@ class CambrianQwenForCausalLM(Qwen2ForCausalLM, CambrianMetaForCausalLM):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        if self.config.nfp_head:
+        if hasattr(self.config, 'nfp_head') and self.config.nfp_head:
             total_loss = (
                 loss + nfp_mse_loss + nfp_cosine_loss,
                 loss,
