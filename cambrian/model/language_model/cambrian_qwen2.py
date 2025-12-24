@@ -450,7 +450,7 @@ class CambrianQwenForCausalLM(Qwen2ForCausalLM, CambrianMetaForCausalLM):
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 
-        if hasattr(self.config, 'nfp_head') and self.config.nfp_head:
+        if hasattr(self.config, 'nfp_head') and self.config.nfp_head and self.training:
             nfp_outputs = self.model.nfp_head(hidden_states)
             nfp_mse_loss, nfp_cosine_loss = self.nfp_loss(nfp_outputs, nfp_tgt_embeds, nfp_loss_masks)
             nfp_mse_loss = nfp_mse_loss * self.config.nfp_mse_loss_weight
@@ -473,7 +473,7 @@ class CambrianQwenForCausalLM(Qwen2ForCausalLM, CambrianMetaForCausalLM):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        if hasattr(self.config, 'nfp_head') and self.config.nfp_head:
+        if hasattr(self.config, 'nfp_head') and self.config.nfp_head and self.training:
             total_loss = (
                 loss + nfp_mse_loss + nfp_cosine_loss,
                 loss,
