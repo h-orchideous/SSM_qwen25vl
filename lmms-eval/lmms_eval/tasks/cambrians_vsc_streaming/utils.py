@@ -33,6 +33,12 @@ def process_docs_streaming_10mins(dataset: datasets.Dataset) -> datasets.Dataset
 def process_docs_streaming_30mins(dataset: datasets.Dataset) -> datasets.Dataset:
     return dataset.filter(lambda x: x["split"] == "30mins_streaming")
 
+def process_docs_streaming_60mins(dataset: datasets.Dataset) -> datasets.Dataset:
+    return dataset.filter(lambda x: x["split"] == "60mins_streaming")
+
+def process_docs_streaming_120mins(dataset: datasets.Dataset) -> datasets.Dataset:
+    return dataset.filter(lambda x: x["split"] == "120mins_streaming")
+
 def fuzzy_matching(pred):
     return pred.split(" ")[0].rstrip(".").strip()
 
