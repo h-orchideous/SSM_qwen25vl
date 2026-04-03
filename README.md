@@ -49,6 +49,7 @@
 </div>
 
 ## Release
+- [Apr 3, 2026] 🚀 Meta information of our curated VSI-590K dataset is released here [VSI-590K-MetaInfo](https://huggingface.co/datasets/nyu-visionx/VSI-590K-MetaInfo).
 - [Dec 21, 2025] 🚀 [Cambrian-S-3M](https://huggingface.co/datasets/nyu-visionx/Cambrian-S-3M) (our collection of 3M open-sourced video instruction tuning data) is now available! Please check it out!
 - [Nov 6, 2025] 🔥 We release Cambrian-S model weights, training code, and evaluation suite.
 - [Nov 6, 2025] 🔥 We release VSI-SUPER, a benchmark designed for spatial supersensing.
