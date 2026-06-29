@@ -1,4 +1,5 @@
 import os
+import importlib.util
 import torch
 import torch.nn as nn
 
@@ -11,8 +12,18 @@ import numpy as np
 import gcsfs
 # from google.cloud import storage
 import io
-import torch_xla.core.xla_model as xm
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
+
+if os.getenv("CAMBRIAN_LAUNCHER") not in {"TORCHXLA_SPMD", "TORCHXLA_MP"}:
+    _find_spec = importlib.util.find_spec
+
+    def _find_spec_without_torch_xla(name, package=None):
+        if name == "torch_xla" or name.startswith("torch_xla."):
+            return None
+        return _find_spec(name, package)
+
+    importlib.util.find_spec = _find_spec_without_torch_xla
+
 from transformers import Trainer
 from transformers.trainer import (
     is_sagemaker_mp_enabled,
@@ -20,11 +31,17 @@ from transformers.trainer import (
     has_length,
     ALL_LAYERNORM_LAYERS,
     logger,
-    is_torch_tpu_available
 )
 
 from ezcolorlog import root_logger as logger
 from cambrian.utils import IS_XLA_AVAILABLE
+
+if IS_XLA_AVAILABLE:
+    import torch_xla.core.xla_model as xm
+    from torch_xla.core.xla_model import all_reduce
+else:
+    xm = None
+    all_reduce = None
 
 from packaging import version
 if is_sagemaker_mp_enabled():
@@ -187,10 +204,11 @@ def _fetch_gradients(optimizer, param_to_name, selected_module_names):
                         gradients.append(p.grad.data)
     return gradients
 
-from torch_xla.core.xla_model import all_reduce
 REDUCE_SUM = 'sum'
 def reduce_gradients(optimizer, param_to_name, selected_module_names, groups=None, pin_layout=True):
-    count = xrt_world_size()
+    if not IS_XLA_AVAILABLE or xm is None or all_reduce is None:
+        return
+    count = xm.xrt_world_size()
     if count > 1:
         gradients = _fetch_gradients(optimizer, param_to_name, selected_module_names)
         all_reduce(
@@ -210,6 +228,14 @@ def map_params_to_module_names(model_list):
 
 
 class CambrianTrainer(Trainer):
+
+    def _move_model_to_device(self, model, device):
+        # bitsandbytes quantized models are already dispatched at load time.
+        # A second `.to(...)` is not supported and raises ValueError.
+        if getattr(self.args, "bits", 16) in [4, 8]:
+            logger.info("Skip _move_model_to_device for %s-bit model", self.args.bits)
+            return model
+        return super()._move_model_to_device(model, device)
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
@@ -231,7 +257,8 @@ class CambrianTrainer(Trainer):
         if os.getenv("HEARTBEAT_URL", None) is not None:
             if torch.distributed.get_rank() == 0:
                 send_heartbeat()
-            xm.rendezvous("heartbeat")
+            if IS_XLA_AVAILABLE and xm is not None:
+                xm.rendezvous("heartbeat")
 
         model.train()
         inputs = self._prepare_inputs(inputs)
@@ -472,6 +499,8 @@ class CambrianTrainer(Trainer):
         return text
     
     def _load_rng_state(self, resume_from_checkpoint):
+        if not IS_XLA_AVAILABLE or xm is None:
+            return
         if resume_from_checkpoint is None:
             return
 
@@ -508,6 +537,8 @@ class CambrianTrainer(Trainer):
         print("rng state loaded")
 
     def _load_optimizer_and_scheduler(self, resume_from_checkpoint):
+        if not IS_XLA_AVAILABLE or xm is None:
+            return
         if resume_from_checkpoint is None:
             return
 
@@ -562,6 +593,8 @@ class CambrianTrainer(Trainer):
         print("Loaded optimizer state successfully")
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        if not IS_XLA_AVAILABLE or xm is None:
+            return super()._load_from_checkpoint(resume_from_checkpoint, model=model)
 
         if resume_from_checkpoint is None:
             return
@@ -601,6 +634,8 @@ class CambrianTrainer(Trainer):
         self.model.load_state_dict(state_dict)
 
     def _save_checkpoint(self, model, trial, metrics=None):
+        if not IS_XLA_AVAILABLE or xm is None:
+            return super()._save_checkpoint(model, trial, metrics=metrics)
         from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
         # Names of files
@@ -615,7 +650,6 @@ class CambrianTrainer(Trainer):
         logger.info(f"Saving model checkpoint to {output_dir}")
 
         model = self.model
-        import torch_xla.core.xla_model as xm
         rank = xm.get_ordinal()
         world_size = xm.xrt_world_size()
 
@@ -692,12 +726,18 @@ class CambrianTrainer(Trainer):
 
     def get_train_dataloader(self) -> DataLoader:
         out = super().get_train_dataloader()
-        return out._loader
+        # Newer accelerate returns DataLoaderShard without private `_loader`.
+        if hasattr(out, "_loader"):
+            return out._loader
+        if hasattr(out, "dataloader"):
+            return out.dataloader
+        return out
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        if not IS_XLA_AVAILABLE or xm is None:
+            return super()._save(output_dir, state_dict=state_dict)
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             pass
-        import torch_xla.core.xla_model as xm
         ckpt_prefix = os.path.join(output_dir, "model_ckpt")
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
@@ -777,9 +817,22 @@ class CambrianTrainer(Trainer):
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
 
-            xm.add_step_closure(
-                step_closure,
-                (
+            if IS_XLA_AVAILABLE and xm is not None:
+                xm.add_step_closure(
+                    step_closure,
+                    (
+                        tr_loss,
+                        ntp_loss,
+                        nfp_mse_loss,
+                        nfp_cosine_loss,
+                        learning_rate,
+                        mm_vision_tower_lr,
+                        self.state.global_step,
+                    ),
+                    run_async=True,
+                )
+            else:
+                step_closure(
                     tr_loss,
                     ntp_loss,
                     nfp_mse_loss,
@@ -787,9 +840,7 @@ class CambrianTrainer(Trainer):
                     learning_rate,
                     mm_vision_tower_lr,
                     self.state.global_step,
-                ),
-                run_async=True,
-            )
+                )
 
             """
             if is_torch_tpu_available():
@@ -816,6 +867,8 @@ class CambrianTrainer(Trainer):
             self.store_flos()
 
             self.log(logs)
+
+            """
 
         metrics = None
         if self.control.should_evaluate:

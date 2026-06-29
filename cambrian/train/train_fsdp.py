@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
+import inspect
+import sys
 from typing import Dict, Optional, Sequence, List
 
 import numpy as np
@@ -46,7 +48,7 @@ from cambrian import conversation as conversation_lib
 from cambrian.utils import IS_XLA_AVAILABLE, process_video_with_decord, process_video_with_decord_byframe, process_video_with_decord_bytime, process_gif_with_imageio, process_video_with_decord_nfp
 from cambrian.mm_utils import tokenizer_image_token, tokenizer_image_token_llama3
 from cambrian.train.wandb_nan_alert_callback import NanInfAlertWandbCallback
-from cambrian.model.language_model.cambrian_qwen2 import CambrianQwenForCausalLM
+from cambrian.model.language_model.qwen2_5_ssm import Qwen2_5SSMForCausalLM as CambrianQwenForCausalLM
 from PIL import Image
 
 from ezcolorlog import root_logger as logger
@@ -56,6 +58,12 @@ from pathlib import Path
 
 
 logger.setLevel(logging.INFO)
+
+# Optional SSM compressor import
+try:
+    from cambrian.ssm.ssm_compressor import SSMCacheCompressor
+except Exception:
+    SSMCacheCompressor = None
 
 from safetensors.torch import load_file
 from tabulate import tabulate
@@ -115,6 +123,16 @@ class ModelArguments:
     nfp_cosine_loss_weight: float = 1.0
     si_token_len: int = 729 # token length (without newline) of per subimages for single image (si)
     miv_token_len: int = 196 # token length (without newline) for per subimages for multi images and video (miv)
+    # SSM settings
+    ssm_num_kv_heads: Optional[int] = field(default=None)
+    ssm_head_dim: Optional[int] = field(default=None)
+    ssm_hidden_dim: Optional[int] = field(default=None)
+    ssm_d_state: int = field(default=64)
+    ssm_max_memory_len: int = field(default=256)
+    ssm_fusion_num_heads: int = field(default=8)
+    ssm_fusion_bottleneck: int = field(default=256)
+    ssm_layer_sharing: str = field(default='group4')
+    ssm_use_fast_path: int = field(default=1)
 
 
 @dataclass
@@ -1168,12 +1186,27 @@ class LazySupervisedDataset(Dataset):
         return "video" in sample and not str(sample['video']) in ['', 'None', 'none', 'nan']
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        try:
-            return self._getitem_(i)
-        except BaseException as e:
-            print(f"Error occurs when loading data at index {i}", flush=True)
-            print(e, flush=True)
-            import sys; sys.exit(-1)
+        max_retries = 20
+        cur_idx = i
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                return self._getitem_(cur_idx)
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Error occurs when loading data at index {cur_idx} "
+                    f"(attempt {attempt + 1}/{max_retries + 1}): {repr(e)}"
+                )
+                if attempt >= max_retries:
+                    break
+                import random
+                cur_idx = random.randint(0, len(self) - 1)
+
+        raise RuntimeError(
+            f"Failed to load data after {max_retries + 1} attempts. "
+            f"Last index={cur_idx}, last_error={repr(last_error)}"
+        ) from last_error
     
     def _getitem_(self, i):
         with open(self.data_path, 'r') as file:
@@ -1204,10 +1237,9 @@ class LazySupervisedDataset(Dataset):
 
             try:
                 image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
-            except:
-                logger.warning(f"Error occurs when load image from {os.path.join(image_folder, image_file)}")
-                import random
-                return random.randint(0, len(self) - 1) # if error occurs, random return another sample
+            except Exception as error:
+                logger.warning(f"Error occurs when load image from {os.path.join(image_folder, image_file)}: {error}")
+                raise RuntimeError(f"Failed to load image from {os.path.join(image_folder, image_file)}: {error}") from error
 
             image_size = image.size
 
@@ -1277,8 +1309,9 @@ class LazySupervisedDataset(Dataset):
         elif has_video:
             is_nfp_video = dat.get("nfp", False)
             video_file = dat['video']
-            video_folder = self.data_args.video_folder
-            video_file = os.path.join(video_folder, video_file)
+            video_folder = self.data_args.video_folder if self.data_args.video_folder not in [None, ""] else self.data_args.image_folder
+            if not os.path.isabs(video_file):
+                video_file = os.path.join(video_folder, video_file)
 
             # use_1fps_video = False
             # if not "shareVideoGPTV" in video_file:
@@ -1373,8 +1406,7 @@ class LazySupervisedDataset(Dataset):
                             video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
             except BaseException as error:
                 logger.warning(f"Error occurs when load video from {video_file}: {error}")
-                import random
-                return self.__getitem__(random.randint(0, len(self) - 1)) # if error occurs, random return another sample
+                raise RuntimeError(f"Failed to load video from {video_file}: {error}") from error
 
             video_h, video_w = video.shape[1:3]
             image_size = (video_w, video_h)
@@ -1424,8 +1456,7 @@ class LazySupervisedDataset(Dataset):
 
         if (data_dict['labels']!=IGNORE_INDEX).sum()==0:
             logger.warning("All tokens are masked, random return another sample")
-            import random
-            return self.__getitem__(random.randint(0, len(self) - 1)) # if all tokens are masked, random return another sample
+            raise RuntimeError("All tokens are masked for this sample")
 
         assert self.data_args.si_token_len >= 0
         assert self.data_args.miv_token_len >= 0
@@ -1950,7 +1981,6 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 # TPU-V4, for example, has 100GB of memory, and a 30b model will take up at least 120GB of memory. So the solution here is to load the model in bf16.
 # Then, we rewrote the FSDP sharding code to convert the bf16 weights to FP32 weights only when shard the weight. Hence, we can use minimal memory to load and shard the model on TPU.
 
-import torch_xla
 import os
 XLA_DISABLE_FUNCTIONALIZATION = bool(
     os.environ.get('XLA_DISABLE_FUNCTIONALIZATION', False))
@@ -2082,8 +2112,8 @@ if IS_XLA_AVAILABLE:
 def train(INDEX, attn_implementation=None):
 
     import wandb
-    import torch_xla.core.xla_model as xm
     if os.getenv("CAMBRIAN_LAUNCHER", "") == "TORCHXLA_SPMD":
+        import torch_xla.core.xla_model as xm
         logger.info("Run with torchxla spmd...")
         if torch.distributed.get_rank() == 0:
             if os.getenv('WANDB_API_KEY', None) is not None:
@@ -2097,6 +2127,7 @@ def train(INDEX, attn_implementation=None):
             os.environ["WANDB_MODE"] = "disabled" # ! NOTE: disable wandb for non-master node
 
     elif os.getenv("CAMBRIAN_LAUNCHER", "") == "TORCHXLA_MP":
+        import torch_xla.core.xla_model as xm
         logger.info("Run with torchxla mp...")
         if os.getenv('WANDB_API_KEY', None) is not None and xm.get_ordinal() == 0:
             wandb.login(key=os.getenv('WANDB_API_KEY'))
@@ -2115,6 +2146,23 @@ def train(INDEX, attn_implementation=None):
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+
+    expected_python = os.environ.get("CAMBRIAN_EXPECT_PYTHON")
+    if expected_python and Path(sys.executable).resolve() != Path(expected_python).resolve():
+        raise RuntimeError(
+            f"Wrong Python interpreter: expected {expected_python}, got {sys.executable}"
+        )
+
+    expected_model_impl = os.environ.get("CAMBRIAN_EXPECT_MODEL_IMPL")
+    if expected_model_impl and CambrianQwenForCausalLM.__module__ != expected_model_impl:
+        raise RuntimeError(
+            f"Wrong model implementation: expected {expected_model_impl}, got {CambrianQwenForCausalLM.__module__}"
+        )
+
+    log_rank0(f"Python executable: {sys.executable}")
+    log_rank0(f"Conda env hint: {os.environ.get('CAMBRIAN_EXPECT_ENV', os.environ.get('CONDA_DEFAULT_ENV', 'unknown'))}")
+    log_rank0(f"Model implementation: {CambrianQwenForCausalLM.__module__}")
+    log_rank0(f"Model source: {inspect.getsourcefile(CambrianQwenForCausalLM)}")
 
     # verify that the train_batch_size is set correctly
     if training_args.batch_size is not None:
@@ -2161,8 +2209,20 @@ def train(INDEX, attn_implementation=None):
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
+        bnb_device_map = {"": training_args.device}
+        bnb_max_memory = None
+        if os.getenv("CAMBRIAN_DEVICE_MAP_AUTO", "") == "1":
+            bnb_device_map = os.getenv("CAMBRIAN_DEVICE_MAP_STRATEGY", "balanced_low_0")
+            if torch.cuda.is_available():
+                reserve_gib = int(os.getenv("CAMBRIAN_RESERVE_GIB", "2"))
+                bnb_max_memory = {}
+                for i in range(torch.cuda.device_count()):
+                    total_gib = int(torch.cuda.get_device_properties(i).total_memory // (1024 ** 3))
+                    max_gib = max(1, total_gib - reserve_gib)
+                    bnb_max_memory[i] = f"{max_gib}GiB"
+                log_rank0(f"Quantized loading with device_map={bnb_device_map}, max_memory={bnb_max_memory}")
         bnb_model_from_pretrained_args.update(dict(
-            device_map={"": training_args.device},
+            device_map=bnb_device_map,
             load_in_4bit=training_args.bits == 4,
             load_in_8bit=training_args.bits == 8,
             quantization_config=BitsAndBytesConfig(
@@ -2176,6 +2236,8 @@ def train(INDEX, attn_implementation=None):
                 bnb_4bit_quant_type=training_args.quant_type # {'fp4', 'nf4'}
             )
         ))
+        if bnb_max_memory is not None:
+            bnb_model_from_pretrained_args["max_memory"] = bnb_max_memory
     else:
         log_rank0(f"Loading model in full precision")
 
@@ -2231,10 +2293,67 @@ def train(INDEX, attn_implementation=None):
     model.config.use_cache = False
     model.generation_config.do_sample = True
 
+    if training_args.bits in [4, 8] and os.getenv("CAMBRIAN_DEVICE_MAP_AUTO", "") == "1" and getattr(model, "hf_device_map", None):
+        # Keep the real shard map for debugging while presenting a single-device map to Accelerate's k-bit checks.
+        model._cambrian_real_hf_device_map = dict(model.hf_device_map)
+        model.hf_device_map = {"": torch.cuda.current_device() if torch.cuda.is_available() else "cpu"}
+        log_rank0("Applied Accelerate k-bit single-device compatibility view for Trainer.prepare")
+
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
     log_rank0("Model loaded.")
+
+    # Create SSM compressor if available and configured
+    ssm_compressor = None
+    if SSMCacheCompressor is not None:
+        try:
+            num_layers = getattr(model.config, 'num_hidden_layers', None) or 1
+
+            # determine num_kv_heads
+            if model_args.ssm_num_kv_heads is not None:
+                num_kv_heads = model_args.ssm_num_kv_heads
+            else:
+                num_kv_heads = None
+                for attr in ('num_kv_heads', 'num_key_value_heads', 'num_attention_heads', 'num_heads'):
+                    if hasattr(model.config, attr):
+                        num_kv_heads = getattr(model.config, attr)
+                        break
+                if num_kv_heads is None:
+                    num_kv_heads = 1
+
+            # determine head_dim
+            if model_args.ssm_head_dim is not None:
+                head_dim = model_args.ssm_head_dim
+            else:
+                head_dim = max(1, model.config.hidden_size // max(1, num_kv_heads))
+
+            # determine hidden_dim
+            hidden_dim = model_args.ssm_hidden_dim if model_args.ssm_hidden_dim is not None else model.config.hidden_size
+
+            ssm_kwargs = dict(
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                hidden_dim=hidden_dim,
+                d_state=model_args.ssm_d_state,
+                max_memory_len=model_args.ssm_max_memory_len,
+                fusion_num_heads=model_args.ssm_fusion_num_heads,
+                fusion_bottleneck=model_args.ssm_fusion_bottleneck,
+                layer_sharing=model_args.ssm_layer_sharing,
+            )
+            compressor_sig = inspect.signature(SSMCacheCompressor.__init__)
+            if "use_fast_path" in compressor_sig.parameters:
+                ssm_kwargs["use_fast_path"] = bool(model_args.ssm_use_fast_path)
+
+            ssm_compressor = SSMCacheCompressor(**ssm_kwargs)
+            log_rank0("SSM compressor created.")
+        except Exception as e:
+            ssm_compressor = None
+            log_rank0(f"Failed to create SSM compressor: {e}")
+
+    if ssm_compressor is not None:
+        model.ssm_compressor = ssm_compressor
 
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
@@ -2363,7 +2482,7 @@ def train(INDEX, attn_implementation=None):
             model.requires_grad_(False)
             # for p in model.get_model().mm_projector.parameters():
             #     p.requires_grad = True
-            tune_modules = ['mm_projector', 'pos_emb', 'vision_sampler', 'vision_sampler_layers', 'vision_query', 'image_newline']
+            tune_modules = ['mm_projector', 'pos_emb', 'vision_sampler', 'vision_sampler_layers', 'vision_query', 'image_newline', 'ssm_compressor']
             for name, param in model.named_parameters():
                 if any(listed_name in name for listed_name in tune_modules):
                     print_rank0('tuning {}'.format(name))
@@ -2425,7 +2544,7 @@ def train(INDEX, attn_implementation=None):
 
 
 
-    if training_args.bf16:
+    if training_args.bf16 and training_args.bits not in [4, 8]:
         model = model.to(dtype=torch.float32)
 
     ########################################################################################
@@ -2489,10 +2608,23 @@ def train(INDEX, attn_implementation=None):
         verbose.append([name, param.shape, param.requires_grad])
     logger.info(f"\n{tabulate(verbose, headers='firstrow', tablefmt='pipe')}")
 
+    if training_args.bits in [4, 8]:
+        log_rank0(f"Quantized loading enabled ({training_args.bits}-bit), trainer will skip model.to(device)")
+        # We train project adapters (mm/ssm) on top of a quantized backbone without PEFT wrappers.
+        # Transformers Trainer blocks this path unless these compatibility flags are present.
+        model._hf_peft_config_loaded = True
+        model._is_quantized_training_enabled = True
+        if os.getenv("CAMBRIAN_DEVICE_MAP_AUTO", "") == "1" and getattr(training_args, "n_gpu", 1) > 1:
+            # transformers==4.37 wraps non-8bit models with nn.DataParallel when n_gpu>1.
+            # 4-bit + device_map model parallel must stay in single-process model-parallel mode.
+            training_args._n_gpu = 1
+            log_rank0("Force Trainer n_gpu=1 for quantized device_map model-parallel run")
+
     trainer = CambrianTrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+    trainer.ssm_compressor = getattr(model, "ssm_compressor", None)
     trainer.is_fsdp_enabled = True
 
     if training_args.train_continue:
@@ -2525,4 +2657,4 @@ def train(INDEX, attn_implementation=None):
 
 
 if __name__ == "__main__":
-    train()
+    train(0)

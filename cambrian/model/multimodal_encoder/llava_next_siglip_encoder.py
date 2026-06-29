@@ -29,7 +29,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers import PretrainedConfig
 from transformers.utils import ModelOutput
 
-from cambrian.utils import IS_XLA_AVAILABLE
+from cambrian.utils import IS_XLA_AVAILABLE, get_gradient_checkpointing_func
 from ezcolorlog import root_logger as logger
 
 class SigLipImageProcessor:
@@ -375,12 +375,10 @@ class SigLipEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        if IS_XLA_AVAILABLE:
-            # Very Important for TorchXLA
-            #self.model.gradient_checkpointing = False
-                
-            from torch_xla.utils.checkpoint import checkpoint
-            self._gradient_checkpointing_func = checkpoint
+        launcher = os.getenv("CAMBRIAN_LAUNCHER", "")
+        if self.gradient_checkpointing and self.training:
+            if not IS_XLA_AVAILABLE or launcher in ("TORCHXLA_SPMD", "TORCHXLA_MP"):
+                self._gradient_checkpointing_func = get_gradient_checkpointing_func()
 
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
@@ -610,7 +608,8 @@ class SigLipVisionTower(nn.Module):
 
     @property
     def device(self):
-        if IS_XLA_AVAILABLE: # NOTE: force to xla device is available, to avoid incompatibility with FSDP
+        launcher = os.getenv("CAMBRIAN_LAUNCHER", "")
+        if IS_XLA_AVAILABLE and launcher in ("TORCHXLA_SPMD", "TORCHXLA_MP"):
             import torch_xla.core.xla_model as xm
             return xm.xla_device()
         for p in self.vision_tower.parameters():

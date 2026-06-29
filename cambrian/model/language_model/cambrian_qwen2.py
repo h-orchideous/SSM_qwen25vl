@@ -33,7 +33,7 @@ logger = logging.get_logger(__name__)
 
 from ..cambrian_arch import CambrianMetaModel, CambrianMetaForCausalLM
 
-from cambrian.utils import IS_XLA_AVAILABLE
+from cambrian.utils import IS_XLA_AVAILABLE, get_gradient_checkpointing_func
 
 
 class CambrianQwenConfig(Qwen2Config):
@@ -402,12 +402,8 @@ class CambrianQwenForCausalLM(Qwen2ForCausalLM, CambrianMetaForCausalLM):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if IS_XLA_AVAILABLE:
-            # Very Important for TorchXLA
-            #self.model.gradient_checkpointing = False
-                
-            from torch_xla.utils.checkpoint import checkpoint
-            self.model._gradient_checkpointing_func = checkpoint
+        if self.training and getattr(self.model, "gradient_checkpointing", False):
+            self.model._gradient_checkpointing_func = get_gradient_checkpointing_func()
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (

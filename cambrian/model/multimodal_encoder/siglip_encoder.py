@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from open_clip import create_model_from_pretrained 
+import os
 
 from cambrian.utils import IS_XLA_AVAILABLE
 
@@ -96,7 +97,8 @@ class SiglipVisionTower(ClipVisionTower):
 
     @property
     def device(self): # NOTE: force to xla device is available, to avoid incompatibility with FSDP
-        if IS_XLA_AVAILABLE:
+        launcher = os.getenv("CAMBRIAN_LAUNCHER", "")
+        if IS_XLA_AVAILABLE and launcher in ("TORCHXLA_SPMD", "TORCHXLA_MP"):
             import torch_xla.core.xla_model as xm
             return xm.xla_device()
         else:

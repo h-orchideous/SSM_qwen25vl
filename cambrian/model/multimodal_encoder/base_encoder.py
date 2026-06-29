@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import os
 
 import torch
 import torch.nn as nn
@@ -80,7 +81,8 @@ class BaseVisionTower(nn.Module):
     @property
     def device(self):
         # NOTE: force to xla device is available, to avoid incompatibility with FSDP
-        if IS_XLA_AVAILABLE:
+        launcher = os.getenv("CAMBRIAN_LAUNCHER", "")
+        if IS_XLA_AVAILABLE and launcher in ("TORCHXLA_SPMD", "TORCHXLA_MP"):
             import torch_xla.core.xla_model as xm
             return xm.xla_device()
         # Dynamically infer the device from the first parameter, if not explicitly specified

@@ -34,6 +34,10 @@ except ImportError:
     xs = None
 
 
+def _use_xla_spmd():
+    return os.getenv("CAMBRIAN_LAUNCHER", "") == "TORCHXLA_SPMD" and IS_XLA_AVAILABLE and xs is not None
+
+
 class CustomKernel(torch.autograd.Function):
 
     @staticmethod
@@ -81,6 +85,10 @@ class CustomKernel(torch.autograd.Function):
         return full_grad[:, :input_seqlen].clone(), full_grad[:, input_seqlen:input_seqlen+1].clone(), full_grad[:, input_seqlen+1:].clone(), None
 
 def apply_custom_kernel(input_embeds, newline_tokens, img_embeds, token_indices):
+    if not _use_xla_spmd():
+        merged = torch.cat([input_embeds, newline_tokens, img_embeds], dim=1)
+        gather_index = token_indices.unsqueeze(-1).expand(-1, -1, merged.size(-1))
+        return torch.gather(merged, 1, gather_index)
     return CustomKernel.apply(input_embeds, newline_tokens, img_embeds, token_indices)
 
 class CustomScatterKernel(torch.autograd.Function):
@@ -117,6 +125,8 @@ class CustomScatterKernel(torch.autograd.Function):
         return tgt_embeds_grad, src_embeds_grad, None
 
 def apply_custom_scatter_kernel(tgt_embeds, src_embeds, indices):
+    if not _use_xla_spmd():
+        return tgt_embeds.scatter(1, indices.unsqueeze(-1).expand(-1, -1, tgt_embeds.size(-1)), src_embeds)
     return CustomScatterKernel.apply(tgt_embeds, src_embeds, indices)
 
 class ShardedBLD2BCHW(torch.autograd.Function):
@@ -144,6 +154,8 @@ class ShardedBLD2BCHW(torch.autograd.Function):
         return full_grad, None
 
 def apply_sharded_bld2bchw(input_tensor, hw):
+    if not _use_xla_spmd():
+        return input_tensor.unflatten(1, hw).permute(0, 3, 1, 2)
     return ShardedBLD2BCHW.apply(input_tensor, hw)
 
 
@@ -177,6 +189,10 @@ class ShardedBCHW2BLD(torch.autograd.Function):
         return full_grad, None, None
 
 def apply_sharded_bchw2bld(input_tensor, bs, nimgs_per_sample):
+    if not _use_xla_spmd():
+        output = input_tensor.flatten(2, 3).permute(0, 2, 1)
+        output = output.unflatten(0, (bs, nimgs_per_sample)).flatten(1, 2)
+        return output
     return ShardedBCHW2BLD.apply(input_tensor, bs, nimgs_per_sample)
 
 class CambrianMetaModel:
@@ -413,7 +429,8 @@ class CambrianMetaForCausalLM(ABC):
         elif os.getenv("CAMBRIAN_LAUNCHER", "") == "TORCHXLA_MP":
             image_aux_features_list = self.encode_images(image_aux_list)
         else:
-            raise NotImplementedError
+            # Non-XLA launchers (e.g., DataParallel/DDP on CUDA) share the same encode path.
+            image_aux_features_list = self.encode_images(image_aux_list)
 
         assert len(image_aux_features_list) == 1
         image_features = image_aux_features_list[0]
@@ -474,10 +491,7 @@ class CambrianMetaForCausalLM(ABC):
             pseudo_newline_tokens = torch.zeros(input_embeds.size(0), 1, raw_miv_features.size(2), device=raw_miv_features.device, dtype=raw_miv_features.dtype)
             nfp_tgt_embeds = apply_custom_kernel(nfp_tgt_embeds, pseudo_newline_tokens, raw_miv_features.type_as(nfp_tgt_embeds), nfp_token_indices)
 
-        if IS_XLA_AVAILABLE:
-            return None, position_ids, attention_mask, past_key_values, input_embeds, labels, nfp_tgt_embeds
-        else:
-            raise NotImplementedError
+        return None, position_ids, attention_mask, past_key_values, input_embeds, labels, nfp_tgt_embeds
 
     def prepare_inputs_labels_for_multimodal_for_generation(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,

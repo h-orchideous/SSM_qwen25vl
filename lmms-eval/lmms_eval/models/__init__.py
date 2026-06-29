@@ -81,8 +81,13 @@ AVAILABLE_SIMPLE_MODELS = {
     "vora": "VoRA",
     "cambrians": "CambrianS",
     "cambrians_vsr": "CambrianS_VSR",
+    "cambrians_vsr_sliding_window": "CambrianS_VSR",
+    "cambrians_vsr_sliding_window_ssm": "CambrianS_VSR_SlidingWindow_SSM",
+    "qwen_vsr_sliding_window": "Qwen_VSR_SlidingWindow",
+    "qwen_vsr_sliding_window_ssm": "Qwen_VSR_SlidingWindow_SSM",
     "cambrians_vsc": "CambrianS_VSC",
     "cambrians_vsc_streaming": "CambrianS_VSC_Streaming",
+    "cambrians_vsc_streaming_sliding_window": "CambrianS_VSC_Streaming_SlidingWindow",
 }
 
 AVAILABLE_CHAT_TEMPLATE_MODELS = {

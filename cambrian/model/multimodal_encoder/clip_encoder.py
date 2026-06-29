@@ -7,7 +7,7 @@ from open_clip import create_model_from_pretrained, get_tokenizer
 from ezcolorlog import root_logger as logger
 
 from .base_encoder import BaseVisionTower
-from cambrian.utils import IS_XLA_AVAILABLE
+from cambrian.utils import IS_XLA_AVAILABLE, get_gradient_checkpointing_func
 
 
 def extract_interp(model_name):
@@ -49,10 +49,8 @@ class ClipVisionTower(BaseVisionTower):
         self.vision_tower.requires_grad_(self.unfreeze_mm_vision_tower)
         self.is_loaded = True
 
-        if IS_XLA_AVAILABLE:
-            # Very Important for TorchXLA
-            from torch_xla.utils.checkpoint import checkpoint
-            self.vision_tower.vision_model.encoder._gradient_checkpointing_func = checkpoint
+        if getattr(self.vision_tower.vision_model.encoder, "gradient_checkpointing", False):
+            self.vision_tower.vision_model.encoder._gradient_checkpointing_func = get_gradient_checkpointing_func()
 
     def _feature_select(self, image_features):
         if self.select_feature == 'patch':
@@ -96,9 +94,8 @@ class ClipVisionTower(BaseVisionTower):
         return image_features
 
     def _forward(self, images):
-        if IS_XLA_AVAILABLE:
-            from torch_xla.utils.checkpoint import checkpoint
-            self.vision_tower.vision_model.encoder._gradient_checkpointing_func = checkpoint
+        if getattr(self.vision_tower.vision_model.encoder, "gradient_checkpointing", False):
+            self.vision_tower.vision_model.encoder._gradient_checkpointing_func = get_gradient_checkpointing_func()
 
         with torch.set_grad_enabled(self.unfreeze_mm_vision_tower):
             image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)

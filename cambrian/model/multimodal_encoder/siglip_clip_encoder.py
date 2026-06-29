@@ -3,6 +3,8 @@ import torch.nn as nn
 
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
 
+from cambrian.utils import IS_XLA_AVAILABLE, get_gradient_checkpointing_func
+
 
 class CLIPVisionTower(nn.Module):
     def __init__(self, vision_tower, args, delay_load=False):
@@ -43,9 +45,8 @@ class CLIPVisionTower(nn.Module):
         
         # Very Important for TorchXLA
         #self.vision_tower.vision_model.encoder.gradient_checkpointing = False
-        
-        from torch_xla.utils.checkpoint import checkpoint
-        self.vision_tower.vision_model.encoder._gradient_checkpointing_func = checkpoint 
+        if getattr(self.vision_tower.vision_model.encoder, "gradient_checkpointing", False):
+            self.vision_tower.vision_model.encoder._gradient_checkpointing_func = get_gradient_checkpointing_func()
         
 
         if type(images) is list:

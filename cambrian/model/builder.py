@@ -23,6 +23,26 @@ from cambrian.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN
 from ezcolorlog import root_logger as logger
 
 
+def _randomize_parameters_in_modules(model, module_prefixes, std=0.02):
+    prefixes = tuple(prefix.strip() for prefix in module_prefixes if prefix and prefix.strip())
+    if not prefixes:
+        return 0
+
+    randomized = 0
+    for module_name, module in model.named_modules():
+        if not module_name or not module_name.startswith(prefixes):
+            continue
+
+        for parameter in module.parameters(recurse=False):
+            if not torch.is_floating_point(parameter.data):
+                continue
+            with torch.no_grad():
+                parameter.data.copy_(torch.randn_like(parameter.data) * std)
+            randomized += 1
+
+    return randomized
+
+
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
@@ -47,7 +67,12 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         kwargs['attn_implementation'] = 'flash_attention_2'
 
     logger.info(f'Loading CambrianQwen from {model_path}')
-    from cambrian.model.language_model.cambrian_qwen2 import CambrianQwenForCausalLM
+    if os.getenv("CAMBRIAN_USE_SSM_MODEL", "0") == "1":
+        logger.info("Using SSM language model implementation: qwen2_5_ssm")
+        from cambrian.model.language_model.qwen2_5_ssm import Qwen2_5SSMForCausalLM as CambrianQwenForCausalLM
+    else:
+        logger.info("Using baseline language model implementation: cambrian_qwen2")
+        from cambrian.model.language_model.cambrian_qwen2 import CambrianQwenForCausalLM
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     if 'torch_dtype' in kwargs:
         kwargs['torch_dtype'] = torch.float16
@@ -74,6 +99,12 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         vision_tower_aux.to(device=device, dtype=torch.float16)
 
     image_processor = [vision_tower_aux.image_processor for vision_tower_aux in vision_tower_aux_list]
+
+    if os.getenv("CAMBRIAN_RANDOMIZE_TRAINABLE_PARAMS", "0") == "1":
+        module_prefixes = os.getenv("CAMBRIAN_RANDOMIZE_MODULES", "ssm_compressor,mm_projector,image_newline").split(",")
+        std = float(os.getenv("CAMBRIAN_RANDOMIZE_STD", "0.02"))
+        randomized = _randomize_parameters_in_modules(model, module_prefixes, std=std)
+        logger.info(f"Randomized {randomized} parameter tensors for inference test (std={std})")
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length

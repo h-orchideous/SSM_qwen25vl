@@ -45,6 +45,8 @@ class Qwen2SdpaAttention(Qwen2Attention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        has_past_key_value = past_key_value is not None and len(past_key_value) > 0
+
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
@@ -70,7 +72,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        if past_key_value is not None:
+        if has_past_key_value:
             past_key_value = (
                 torch.cat([past_key_value[0], key_states], dim=2),
                 torch.cat([past_key_value[1], value_states], dim=2),
@@ -187,7 +189,8 @@ def cambrian_qwen2_forward(
     kv_cache = tuple()
     
     batch_size, seq_length, _ = inputs_embeds.size()
-    past_key_values_length = 0 if past_key_values is None else past_key_values[0][0].size(2)
+    has_past_key_values = past_key_values is not None and len(past_key_values) > 0
+    past_key_values_length = 0 if not has_past_key_values else past_key_values[0][0].size(2)
 
     attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
         attention_mask,
@@ -200,11 +203,15 @@ def cambrian_qwen2_forward(
     hidden_states = inputs_embeds
 
     for i, decoder_layer in enumerate(self.layers):
+        layer_past_key_value = None
+        if has_past_key_values and i < len(past_key_values):
+            layer_past_key_value = past_key_values[i]
+
         layer_outputs = decoder_layer(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_values[i] if past_key_values is not None else None,
+            past_key_value=layer_past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )

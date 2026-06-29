@@ -22,6 +22,7 @@ Majority of this documentation is adapted from [lm-eval-harness](https://github.
 * **[Current Tasks](current_tasks.md)** - List of all supported evaluation tasks
 * **[Run Examples](run_examples.md)** - Example commands for running evaluations
 * **[Caching](caching.md)** - Enable and reload results from the JSONL cache
+* **[VSR Qwen2.5-VL Evaluation](vsr_qwen25vl.md)** - Run local VSR with Qwen2.5-VL, sliding window, and SSM mechanisms
 * **[Version 0.3 Features](lmms-eval-0.3.md)** - Audio evaluation and new features
 * **[Throughput Metrics](throughput_metrics.md)** - Understanding performance metrics
 

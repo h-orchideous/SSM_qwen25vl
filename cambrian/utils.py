@@ -1,4 +1,5 @@
 import datetime
+from functools import partial
 import logging
 import logging.handlers
 import os
@@ -17,12 +18,18 @@ handler = None
 import torch
 # TODO: move elsewhere?
 IS_XLA_AVAILABLE = False
-try:
-    import torch_xla
-    from torch_xla.distributed.spmd import XLAShardedTensor
-    IS_XLA_AVAILABLE = True
-except ImportError:
-    pass
+IS_XLA_IMPORT_AVAILABLE = False
+XLAShardedTensor = tuple()
+_launcher = os.getenv("CAMBRIAN_LAUNCHER", "")
+if _launcher in ("TORCHXLA_SPMD", "TORCHXLA_MP"):
+    try:
+        import torch_xla
+        from torch_xla.distributed.spmd import XLAShardedTensor as _XLAShardedTensor
+        XLAShardedTensor = _XLAShardedTensor
+        IS_XLA_IMPORT_AVAILABLE = True
+        IS_XLA_AVAILABLE = True
+    except ImportError:
+        pass
 
 try:
     from decord import VideoReader, cpu
@@ -37,12 +44,24 @@ except ImportError:
 
 def inspect_tensor_sharding(t, **kwargs):
 
+    if not IS_XLA_AVAILABLE:
+        raise RuntimeError("inspect_tensor_sharding is only available in XLA launcher modes")
+
     # XLAShardedTensor is-a torch.Tensor
     def maybe_unwrap(t: torch.Tensor) -> torch.Tensor:
         return t.global_tensor if isinstance(t, XLAShardedTensor) else t
 
     sharding = torch_xla._XLAC._get_xla_sharding_spec(maybe_unwrap(t))
     return sharding
+
+
+def get_gradient_checkpointing_func():
+    if IS_XLA_AVAILABLE:
+        from torch_xla.utils.checkpoint import checkpoint
+        return checkpoint
+
+    # PyTorch 2.6 requires selecting the reentrant variant explicitly.
+    return partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
 
 import random
 

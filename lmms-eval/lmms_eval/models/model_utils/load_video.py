@@ -50,15 +50,17 @@ def record_video_length_packet(container):
 def load_video_stream(container, num_frm: int = 8, fps: float = None, force_include_last_frame=False):
     # container = av.open(video_path)
     total_frames = container.streams.video[0].frames
+    if total_frames <= 0:
+        raise ValueError("Video contains no frames")
     frame_rate = container.streams.video[0].average_rate
     if fps is not None:
         video_length = total_frames / frame_rate
         num_frm = min(num_frm, int(video_length * fps))
-    sampled_frm = min(total_frames, num_frm)
+    sampled_frm = max(1, min(total_frames, num_frm))
     indices = np.linspace(0, total_frames - 1, sampled_frm, dtype=int)
     if force_include_last_frame:
         last_frame = total_frames - 1
-        if last_frame not in indices:
+        if sampled_frm > 1 and last_frame not in indices:
             indices = np.linspace(0, total_frames - 2, sampled_frm - 1, dtype=int)
             indices = np.append(indices, last_frame)
 
@@ -68,11 +70,13 @@ def load_video_stream(container, num_frm: int = 8, fps: float = None, force_incl
 def load_video_packet(container, num_frm: int = 8, fps: float = None):
     frames = record_video_length_packet(container)
     total_frames = len(frames)
+    if total_frames <= 0:
+        raise ValueError("Video contains no frames")
     frame_rate = container.streams.video[0].average_rate
     if fps is not None:
         video_length = total_frames / frame_rate
         num_frm = min(num_frm, int(video_length * fps))
-    sampled_frm = min(total_frames, num_frm)
+    sampled_frm = max(1, min(total_frames, num_frm))
     indices = np.linspace(0, total_frames - 1, sampled_frm, dtype=int)
 
     # Append the last frame index if not already included

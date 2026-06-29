@@ -5,7 +5,7 @@ from ezcolorlog import root_logger as logger
 
 from transformers import Dinov2Model, AutoImageProcessor, Dinov2Config
 
-from cambrian.utils import IS_XLA_AVAILABLE
+from cambrian.utils import IS_XLA_AVAILABLE, get_gradient_checkpointing_func
 
 from .base_encoder import BaseVisionTower
 
@@ -157,9 +157,8 @@ class DinoVisionTower(BaseVisionTower):
 
     def _forward(self, images):
         # logger.warning(f"images shape: {images.shape}")
-        if IS_XLA_AVAILABLE:
-            from torch_xla.utils.checkpoint import checkpoint
-            self.vision_tower.encoder._gradient_checkpointing_func = checkpoint
+        if getattr(self.vision_tower.encoder, "gradient_checkpointing", False):
+            self.vision_tower.encoder._gradient_checkpointing_func = get_gradient_checkpointing_func()
 
         with torch.set_grad_enabled(self.unfreeze_mm_vision_tower):
             image_forward_outs = self.vision_tower.forward(images.to(device=self.device, dtype=self.dtype))

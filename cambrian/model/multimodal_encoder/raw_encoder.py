@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import numpy as np
-from torch_xla.utils.checkpoint import checkpoint
 from huggingface_hub import hf_hub_download
 import torch.nn.functional as F
 from .base_encoder import ProcessorWrapper
