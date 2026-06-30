@@ -13,6 +13,9 @@ AVAILABLE_SIMPLE_MODELS = {
     "qwen2_5_vl": "Qwen2_5_VL",
     "qwen_vsr_sliding_window": "Qwen_VSR_SlidingWindow",
     "qwen_vsr_sliding_window_ssm": "Qwen_VSR_SlidingWindow_SSM",
+    "qwen2_5_vl_vsc": "Qwen2_5_VL_VSC",
+    "qwen_vsc_sliding_window": "Qwen_VSC_SlidingWindow",
+    "qwen_vsc_sliding_window_ssm": "Qwen_VSC_SlidingWindow_SSM",
 }
 
 AVAILABLE_CHAT_TEMPLATE_MODELS = {}
