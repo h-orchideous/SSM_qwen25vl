@@ -74,12 +74,14 @@ class Qwen_VSR_SlidingWindow(lmms):
         enable_visual_feature_caching: bool = False,
         sensory_window_max_tokens: Optional[int] = 0,
         stream_visual_micro_batch_size: int = 1,
+        stream_query_mode: str = "chunk",
         conv_template: Optional[str] = "qwen_2",
         max_image_size: Optional[int] = None,  # Only applicable if use_custom_video_loader is True
         use_fast_processor: Optional[bool] = None,
         system_prompt: Optional[str] = "You are a helpful assistant.",
         interleave_visuals: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
+        log_prefix: str = LOG_PREFIX,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -92,6 +94,7 @@ class Qwen_VSR_SlidingWindow(lmms):
             raise ValueError(f"attn_implementation must be one of {valid_attn_implementations}, got {attn_implementation}")
 
         self.use_custom_video_loader = use_custom_video_loader
+        self.log_prefix = str(log_prefix)
         self.video_force_sample = bool(video_force_sample)
         self.add_time_instruction = bool(add_time_instruction)
         self.miv_token_len = int(miv_token_len)
@@ -104,6 +107,9 @@ class Qwen_VSR_SlidingWindow(lmms):
         self.sliding_window_stride = int(sliding_window_stride) if sliding_window_stride is not None else max(1, self.sensory_window_size // 2)
         self.sensory_window_max_tokens = None if sensory_window_max_tokens is None or int(sensory_window_max_tokens) <= 0 else int(sensory_window_max_tokens)
         self.stream_visual_micro_batch_size = max(1, int(stream_visual_micro_batch_size))
+        self.stream_query_mode = str(stream_query_mode).lower()
+        if self.stream_query_mode not in {"chunk", "frame"}:
+            raise ValueError(f"stream_query_mode must be 'chunk' or 'frame', got {stream_query_mode}")
         self.fps = None if video_fps is None else float(video_fps)
         # if self.fps and not self.use_custom_video_loader:
         #     raise ValueError("FPS is only applicable if use_custom_video_loader is True")
@@ -146,12 +152,13 @@ class Qwen_VSR_SlidingWindow(lmms):
         eval_logger.info(f"sliding_window_stride: {self.sliding_window_stride}")
         eval_logger.info(f"sensory_window_max_tokens: {self.sensory_window_max_tokens}")
         eval_logger.info(f"stream_visual_micro_batch_size: {self.stream_visual_micro_batch_size}")
+        eval_logger.info(f"stream_query_mode: {self.stream_query_mode}")
         eval_logger.info(
-            f"[{LOG_PREFIX} init] backend=raw_qwen25vl video_max_frames={self.max_num_frames} video_fps={self.fps} sensory_window_size={self.sensory_window_size} sliding_window_stride={self.sliding_window_stride} sensory_window_max_tokens={self.sensory_window_max_tokens} stream_visual_micro_batch_size={self.stream_visual_micro_batch_size}"
+            f"[{self.log_prefix} init] backend=raw_qwen25vl video_max_frames={self.max_num_frames} video_fps={self.fps} sensory_window_size={self.sensory_window_size} sliding_window_stride={self.sliding_window_stride} sensory_window_max_tokens={self.sensory_window_max_tokens} stream_visual_micro_batch_size={self.stream_visual_micro_batch_size} stream_query_mode={self.stream_query_mode}"
         )
         if self.max_num_frames == 1 and self.sensory_window_size > 1:
             eval_logger.warning(
-                f"[{LOG_PREFIX} init] video_max_frames=1: each chunk contributes one frame only; frame-drop sliding may not trigger for large windows"
+                f"[{self.log_prefix} init] video_max_frames=1: each chunk contributes one frame only; frame-drop sliding may not trigger for large windows"
             )
 
         if reasoning_prompt:
@@ -426,7 +433,7 @@ class Qwen_VSR_SlidingWindow(lmms):
 
     def _decode_with_past_key_values(self, past_key_values, post_tokens: torch.Tensor, current_gen_kwargs: dict):
         if post_tokens.size(1) == 0:
-            eval_logger.warning(f"[{LOG_PREFIX} kv] empty post_tokens encountered; fallback to one pad token for decoding bootstrap")
+            eval_logger.warning(f"[{self.log_prefix} kv] empty post_tokens encountered; fallback to one pad token for decoding bootstrap")
             post_tokens = torch.full(
                 (1, 1),
                 self.tokenizer.pad_token_id,
@@ -458,7 +465,7 @@ class Qwen_VSR_SlidingWindow(lmms):
             return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
         if int(current_gen_kwargs.get("num_beams", 1)) != 1:
-            eval_logger.warning(f"[{LOG_PREFIX} kv] num_beams>1 is not supported in incremental manual decode, falling back to greedy/sampling with num_beams=1")
+            eval_logger.warning(f"[{self.log_prefix} kv] num_beams>1 is not supported in incremental manual decode, falling back to greedy/sampling with num_beams=1")
 
         out = self.model(
             input_ids=post_tokens,
@@ -567,11 +574,11 @@ class Qwen_VSR_SlidingWindow(lmms):
                             drop_tokens=drop_tokens,
                         )
 
-                # Streaming query: ask once for each newly arrived frame.
-                query_cache = self._clone_cache(past_key_values)
-                window_answer = self._decode_with_past_key_values(query_cache, post_tokens, current_gen_kwargs)
-                window_answers.append(window_answer)
-                query_count += 1
+                if self.stream_query_mode == "frame":
+                    query_cache = self._clone_cache(past_key_values)
+                    window_answer = self._decode_with_past_key_values(query_cache, post_tokens, current_gen_kwargs)
+                    window_answers.append(window_answer)
+                    query_count += 1
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -579,7 +586,12 @@ class Qwen_VSR_SlidingWindow(lmms):
             if len(frame_token_lengths) == 0:
                 return "", 0, 0, 0
 
-            chunk_ans = self._aggregate_window_answers(window_answers)
+            if self.stream_query_mode == "chunk":
+                query_cache = self._clone_cache(past_key_values)
+                chunk_ans = self._decode_with_past_key_values(query_cache, post_tokens, current_gen_kwargs)
+                query_count = 1
+            else:
+                chunk_ans = self._aggregate_window_answers(window_answers)
             kept_frames = len(frame_token_lengths)
             return chunk_ans, kept_frames, evicted_frames, query_count
 
@@ -635,14 +647,14 @@ class Qwen_VSR_SlidingWindow(lmms):
 
         if token_lengths:
             eval_logger.info(
-                f"[{LOG_PREFIX} visual] frames={len(token_lengths)} max_frame_tokens={max(token_lengths)} avg_frame_tokens={(sum(token_lengths) / len(token_lengths)):.1f} micro_batch={self.stream_visual_micro_batch_size}"
+                f"[{self.log_prefix} visual] frames={len(token_lengths)} max_frame_tokens={max(token_lengths)} avg_frame_tokens={(sum(token_lengths) / len(token_lengths)):.1f} micro_batch={self.stream_visual_micro_batch_size}"
             )
 
         return frame_features, token_lengths, chunk_frame_counts
 
     def _run_streaming_video(self, context: str, static_visuals: List[dict], video_paths: List[str], current_gen_kwargs: dict, until: List[str]):
         if static_visuals:
-            raise NotImplementedError(f"[{LOG_PREFIX}] streaming sw currently supports video-only requests")
+            raise NotImplementedError(f"[{self.log_prefix}] streaming sw currently supports video-only requests")
 
         if not video_paths:
             return ""
@@ -654,7 +666,7 @@ class Qwen_VSR_SlidingWindow(lmms):
             try:
                 vr = decord.VideoReader(chunk_path)
             except Exception as exc:
-                eval_logger.warning(f"[{LOG_PREFIX} chunk] failed to open video={chunk_path} err={exc}")
+                eval_logger.warning(f"[{self.log_prefix} chunk] failed to open video={chunk_path} err={exc}")
                 continue
 
             total_frames = len(vr)
@@ -675,7 +687,7 @@ class Qwen_VSR_SlidingWindow(lmms):
                     frame = Image.fromarray(vr[frame_idx].asnumpy()).convert("RGB")
                 except Exception as exc:
                     eval_logger.warning(
-                        f"[{LOG_PREFIX} chunk] skip unreadable frame. video={chunk_path} frame_idx={frame_idx} err={exc}"
+                        f"[{self.log_prefix} chunk] skip unreadable frame. video={chunk_path} frame_idx={frame_idx} err={exc}"
                     )
                     continue
 
@@ -706,7 +718,7 @@ class Qwen_VSR_SlidingWindow(lmms):
             except ValueError as exc:
                 if "nframes should in interval" in str(exc):
                     eval_logger.warning(
-                        f"[{LOG_PREFIX} chunk] skip invalid frame-stream chunk. video={chunk_path} err={exc}"
+                        f"[{self.log_prefix} chunk] skip invalid frame-stream chunk. video={chunk_path} err={exc}"
                     )
                     continue
                 raise
@@ -721,16 +733,16 @@ class Qwen_VSR_SlidingWindow(lmms):
 
             chunk_answers.append(chunk_ans)
             eval_logger.info(
-                f"[{LOG_PREFIX} chunk] chunk_index={chunk_idx + 1}/{len(video_paths)} chunk_frames={sampled_count} kept_frames={kept_frames} dropped_frames={evicted_frames} frame_queries={query_count} input_fps={self.fps} kv_mode=frame_stream generate_s={chunk_generate_elapsed:.3f}"
+                f"[{self.log_prefix} chunk] chunk_index={chunk_idx + 1}/{len(video_paths)} chunk_frames={sampled_count} kept_frames={kept_frames} dropped_frames={evicted_frames} queries={query_count} query_mode={self.stream_query_mode} input_fps={self.fps} kv_mode=frame_stream generate_s={chunk_generate_elapsed:.3f}"
             )
 
         if not chunk_answers:
             return ""
         answer = self._aggregate_chunk_answers(chunk_answers)
         eval_logger.info(
-            f"[{LOG_PREFIX} stream] chunks={len(chunk_answers)} total_generate_s={total_generate_elapsed:.3f} avg_generate_s={(total_generate_elapsed / len(chunk_answers)):.3f}"
+            f"[{self.log_prefix} stream] chunks={len(chunk_answers)} total_generate_s={total_generate_elapsed:.3f} avg_generate_s={(total_generate_elapsed / len(chunk_answers)):.3f}"
             if chunk_answers
-            else f"[{LOG_PREFIX} stream] chunks=0 total_generate_s={total_generate_elapsed:.3f}"
+            else f"[{self.log_prefix} stream] chunks=0 total_generate_s={total_generate_elapsed:.3f}"
         )
         return answer
 

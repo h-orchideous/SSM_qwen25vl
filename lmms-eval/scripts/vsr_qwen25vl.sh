@@ -81,9 +81,8 @@ case "$MODEL_VARIANT" in
         output_root_default="logs/vsr/qwen/output_sw_ssm"
         log_suffix_default="qwen_sw_ssm"
         main_process_port_default=29501
-        checkpoint_default="/data1/ZhangHuayu/models/Cambrian-S-7B"
+        checkpoint_default="/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct"
         force_simple_default=0
-        export CAMBRIAN_USE_SSM_MODEL=${CAMBRIAN_USE_SSM_MODEL:-1}
         ;;
     *)
         echo "[vsr_qwen25] ERROR: unsupported MODEL_VARIANT=$MODEL_VARIANT (expected: vl, sw, sw_ssm)"
@@ -144,6 +143,12 @@ sliding_window_stride=${SLIDING_WINDOW_STRIDE:-}
 enable_visual_feature_caching=${ENABLE_VISUAL_FEATURE_CACHING:-True}
 sensory_window_max_tokens=${SENSORY_WINDOW_MAX_TOKENS:-0}
 stream_visual_micro_batch_size=${STREAM_VISUAL_MICRO_BATCH_SIZE:-1}
+stream_query_mode=${STREAM_QUERY_MODE:-chunk}
+ssm_d_state=${SSM_D_STATE:-64}
+ssm_max_memory_len=${SSM_MAX_MEMORY_LEN:-256}
+ssm_fusion_num_heads=${SSM_FUSION_NUM_HEADS:-8}
+ssm_fusion_bottleneck=${SSM_FUSION_BOTTLENECK:-256}
+ssm_layer_sharing=${SSM_LAYER_SHARING:-group4}
 
 # ---------------------------
 # Shared chunk params (all modes)
@@ -159,15 +164,15 @@ keep_chunks=${KEEP_CHUNKS:-0}
 single_video_path=${SINGLE_VIDEO_PATH:-}
 
 if [ -z "${num_frames}" ]; then
-    if [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ]; then
+    if [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ] || [ "$MODEL_VARIANT" = "sw_ssm" ] || [ "$MODEL_VARIANT" = "qwen25_sw_ssm" ]; then
         num_frames=-1
-        echo "[vsr_qwen25] INFO: NUM_FRAMES not set for sw; defaulting to -1 (no per-chunk frame cap)."
+        echo "[vsr_qwen25] INFO: NUM_FRAMES not set for sliding-window mode; defaulting to -1 (no per-chunk frame cap)."
     else
         num_frames=1
     fi
 fi
 
-if { [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ]; } && [ "${num_frames}" -eq 1 ] && [ "${sensory_window_size}" -gt 1 ]; then
+if { [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ] || [ "$MODEL_VARIANT" = "sw_ssm" ] || [ "$MODEL_VARIANT" = "qwen25_sw_ssm" ]; } && [ "${num_frames}" -eq 1 ] && [ "${sensory_window_size}" -gt 1 ]; then
     echo "[vsr_qwen25] WARNING: NUM_FRAMES=1 means each chunk contributes only 1 frame to SW runtime cache."
     echo "[vsr_qwen25] WARNING: with SENSORY_WINDOW_SIZE=${sensory_window_size}, frame-drop sliding is unlikely to trigger unless chunks per video exceed the window size."
     echo "[vsr_qwen25] HINT: for 150s chunks and 140-frame window, try NUM_FRAMES=-1 (or >=140 with VIDEO_FPS=1)."
@@ -198,26 +203,26 @@ if [ "$MODEL_VARIANT" = "vl" ] || [ "$MODEL_VARIANT" = "qwen25vl" ]; then
     model_args_default="pretrained=${checkpoint},min_pixels=${min_pixels},max_pixels=${max_pixels},max_num_frames=${max_num_frames},fps=${video_fps},use_custom_video_loader=${use_custom_video_loader},max_image_size=${max_image_size},attn_implementation=${attn_impl},interleave_visuals=${interleave_visuals},use_fast_processor=${use_fast_processor}"
 elif [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ]; then
     # sw: raw Qwen2.5-VL sliding-window path.
-    model_args_default="pretrained=${checkpoint},min_pixels=${min_pixels},max_pixels=${max_pixels},video_max_frames=${num_frames},video_fps=${video_fps},miv_token_len=${miv_token_len},si_token_len=${si_token_len},sensory_window_size=${sensory_window_size},sensory_window_max_tokens=${sensory_window_max_tokens},stream_visual_micro_batch_size=${stream_visual_micro_batch_size},use_custom_video_loader=${use_custom_video_loader},max_image_size=${max_image_size},attn_implementation=${attn_impl},use_fast_processor=${use_fast_processor}"
+    model_args_default="pretrained=${checkpoint},min_pixels=${min_pixels},max_pixels=${max_pixels},video_max_frames=${num_frames},video_fps=${video_fps},miv_token_len=${miv_token_len},si_token_len=${si_token_len},sensory_window_size=${sensory_window_size},sensory_window_max_tokens=${sensory_window_max_tokens},stream_visual_micro_batch_size=${stream_visual_micro_batch_size},stream_query_mode=${stream_query_mode},use_custom_video_loader=${use_custom_video_loader},max_image_size=${max_image_size},attn_implementation=${attn_impl},use_fast_processor=${use_fast_processor}"
     if [ -n "$sliding_window_stride" ]; then
         model_args_default+=",sliding_window_stride=${sliding_window_stride}"
     fi
 else
-    # sw/sw_ssm: sliding-window Cambrian-Qwen path.
-    model_args_default="pretrained=${checkpoint},conv_template=${conv_template},video_max_frames=${num_frames},miv_token_len=${miv_token_len},si_token_len=${si_token_len},sensory_window_size=${sensory_window_size},enable_visual_feature_caching=${enable_visual_feature_caching}"
+    # sw_ssm: native Qwen2.5-VL sliding-window path with SSM long-memory fusion.
+    model_args_default="pretrained=${checkpoint},min_pixels=${min_pixels},max_pixels=${max_pixels},video_max_frames=${num_frames},video_fps=${video_fps},miv_token_len=${miv_token_len},si_token_len=${si_token_len},sensory_window_size=${sensory_window_size},sensory_window_max_tokens=${sensory_window_max_tokens},stream_visual_micro_batch_size=${stream_visual_micro_batch_size},stream_query_mode=${stream_query_mode},use_custom_video_loader=${use_custom_video_loader},max_image_size=${max_image_size},attn_implementation=${attn_impl},use_fast_processor=${use_fast_processor},ssm_d_state=${ssm_d_state},ssm_max_memory_len=${ssm_max_memory_len},ssm_fusion_num_heads=${ssm_fusion_num_heads},ssm_fusion_bottleneck=${ssm_fusion_bottleneck},ssm_layer_sharing=${ssm_layer_sharing}"
+    if [ -n "$sliding_window_stride" ]; then
+        model_args_default+=",sliding_window_stride=${sliding_window_stride}"
+    fi
 fi
 model_args=${MODEL_ARGS:-$model_args_default}
 
 check_environment() {
-    MODEL_VARIANT="$MODEL_VARIANT" CHECKPOINT="$checkpoint" ALLOW_INCOMPATIBLE_CHECKPOINT="${ALLOW_INCOMPATIBLE_CHECKPOINT:-0}" "$PYTHON_BIN" - <<'PY'
+    MODEL_VARIANT="$MODEL_VARIANT" CHECKPOINT="$checkpoint" "$PYTHON_BIN" - <<'PY'
 import importlib.util
-import json
 import os
 import sys
 
 variant = os.environ.get("MODEL_VARIANT", "vl")
-checkpoint = os.environ.get("CHECKPOINT", "")
-allow_incompatible = os.environ.get("ALLOW_INCOMPATIBLE_CHECKPOINT", "0") == "1"
 
 if importlib.util.find_spec("lmms_eval") is None:
     print("[vsr_qwen25] ERROR: lmms_eval is not importable in current PYTHON_BIN")
@@ -228,32 +233,18 @@ print(f"[vsr_qwen25] transformers_version={transformers.__version__}")
 
 is_vl = variant in {"vl", "qwen25vl"}
 is_sw_raw = variant in {"sw", "qwen25_sw"}
-is_sw_cambrian = variant in {"sw_ssm", "qwen25_sw_ssm"}
-is_sw = is_sw_raw or is_sw_cambrian
+is_sw_ssm = variant in {"sw_ssm", "qwen25_sw_ssm"}
+is_sw = is_sw_raw or is_sw_ssm
 
-if is_vl or is_sw_raw:
+if is_vl or is_sw:
     if not hasattr(transformers, "Qwen2_5_VLForConditionalGeneration"):
         print("[vsr_qwen25] ERROR: current transformers lacks Qwen2_5_VLForConditionalGeneration")
         print("[vsr_qwen25] HINT: upgrade transformers in this env, then retry")
         sys.exit(2)
 
-if is_sw_cambrian and importlib.util.find_spec("cambrian") is None:
-    print("[vsr_qwen25] ERROR: cambrian is not importable in current PYTHONPATH")
+if is_sw_ssm and importlib.util.find_spec("cambrian.ssm.ssm_compressor") is None:
+    print("[vsr_qwen25] ERROR: cambrian.ssm.ssm_compressor is not importable in current PYTHONPATH")
     sys.exit(2)
-
-if variant in {"sw_ssm", "qwen25_sw_ssm"}:
-    cfg_path = os.path.join(checkpoint, "config.json")
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            has_aux = cfg.get("mm_vision_tower_aux_list") is not None
-            if not has_aux and not allow_incompatible:
-                print("[vsr_qwen25] ERROR: checkpoint appears non-Cambrian multimodal (missing mm_vision_tower_aux_list)")
-                print("[vsr_qwen25] HINT: use a Cambrian multimodal checkpoint, or set ALLOW_INCOMPATIBLE_CHECKPOINT=1 to force run")
-                sys.exit(2)
-        except Exception as exc:
-            print(f"[vsr_qwen25] WARNING: failed to parse checkpoint config: {exc}")
 
 print("[vsr_qwen25] environment check passed")
 PY
@@ -345,8 +336,12 @@ run_eval() {
         if [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ]; then
             echo "[vsr_qwen25] sliding_backend=raw_qwen25vl"
         else
-            echo "[vsr_qwen25] sliding_backend=cambrian"
-            echo "[vsr_qwen25] conv_template=$conv_template"
+            echo "[vsr_qwen25] sliding_backend=native_qwen25vl_ssm"
+            echo "[vsr_qwen25] ssm_d_state=$ssm_d_state"
+            echo "[vsr_qwen25] ssm_max_memory_len=$ssm_max_memory_len"
+            echo "[vsr_qwen25] ssm_fusion_num_heads=$ssm_fusion_num_heads"
+            echo "[vsr_qwen25] ssm_fusion_bottleneck=$ssm_fusion_bottleneck"
+            echo "[vsr_qwen25] ssm_layer_sharing=$ssm_layer_sharing"
         fi
         echo "[vsr_qwen25] chunk_params_source=vsr_chunk_settings.sh"
         echo "[vsr_qwen25] num_frames=$num_frames"
@@ -357,13 +352,11 @@ run_eval() {
         echo "[vsr_qwen25] chunk_overlap_seconds=$chunk_overlap_seconds"
         echo "[vsr_qwen25] chunk_max_num_frames=$chunk_max_num_frames"
         echo "[vsr_qwen25] sliding_window_stride=${sliding_window_stride:-auto}"
+        echo "[vsr_qwen25] stream_query_mode=$stream_query_mode"
         echo "[vsr_qwen25] chunk_per_video_flow=$chunk_per_video_flow"
         echo "[vsr_qwen25] chunk_temp_mode=$chunk_temp_mode"
         echo "[vsr_qwen25] keep_chunks=$keep_chunks"
         echo "[vsr_qwen25] enable_visual_feature_caching=$enable_visual_feature_caching"
-    fi
-    if [ "$MODEL_VARIANT" = "sw_ssm" ] || [ "$MODEL_VARIANT" = "qwen25_sw_ssm" ]; then
-        echo "[vsr_qwen25] CAMBRIAN_USE_SSM_MODEL=${CAMBRIAN_USE_SSM_MODEL:-0}"
     fi
 
     if [[ "$chunk_seconds" != "0" && "$chunk_seconds" != "0.0" ]]; then

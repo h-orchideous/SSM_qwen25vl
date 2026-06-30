@@ -8,7 +8,7 @@
 | ----------------- | ------------------------------- | --------------------------------------------- | --------------------------------------------------- |
 | `vl`            | `qwen2_5_vl`                  | 原生 Qwen2.5-VL 视频推理，配合 chunk/fps 控制 | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
 | `sw`            | `qwen_vsr_sliding_window`     | Qwen2.5-VL 滑动窗口视觉缓存                   | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
-| `sw_ssm`        | `qwen_vsr_sliding_window_ssm` | Cambrian-S/Qwen 的滑动窗口 SSM 路径           | `/data1/ZhangHuayu/models/Cambrian-S-7B`          |
+| `sw_ssm`        | `qwen_vsr_sliding_window_ssm` | 原生 Qwen2.5-VL 滑动窗口 + SSM 长期记忆       | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
 
 ## 入口脚本
 
@@ -92,7 +92,7 @@ cd /home/ZhangHuayu/Workspace/cambrian-s/lmms-eval
 MODEL_VARIANT=sw bash scripts/vsr_qwen25vl.sh
 ```
 
-Cambrian-S/Qwen SSM 滑动窗口：
+Qwen2.5-VL SSM 滑动窗口：
 
 ```bash
 cd /home/ZhangHuayu/Workspace/cambrian-s/lmms-eval
@@ -113,11 +113,7 @@ CHECKPOINT=/path/to/Qwen2.5-VL-7B-Instruct \
 bash scripts/vsr_qwen25vl.sh
 ```
 
-`sw_ssm` 模式应使用 Cambrian 多模态 checkpoint。脚本会检查 checkpoint 的 `config.json` 中是否包含 `mm_vision_tower_aux_list`。如果明确需要跳过该检查：
-
-```bash
-ALLOW_INCOMPATIBLE_CHECKPOINT=1 MODEL_VARIANT=sw_ssm bash scripts/vsr_qwen25vl.sh
-```
+`sw_ssm` 模式现在使用原生 Qwen2.5-VL checkpoint，不再要求 Cambrian 多模态 checkpoint。
 
 ## 视频切片配置
 
@@ -196,30 +192,34 @@ SENSORY_WINDOW_SIZE=140
 SLIDING_WINDOW_STRIDE=70
 SENSORY_WINDOW_MAX_TOKENS=0
 STREAM_VISUAL_MICRO_BATCH_SIZE=1
+STREAM_QUERY_MODE=chunk
 ```
 
-如果未设置 `NUM_FRAMES`，`sw` 模式默认使用 `-1`，表示模型路径内部不再限制每个 chunk 的帧数。此时建议主要通过 `CHUNK_MAX_NUM_FRAMES` 控制切片阶段的帧数。
+如果未设置 `NUM_FRAMES`，`sw` 模式默认使用 `-1`，表示模型路径内部不再限制每个 chunk 的帧数。此时建议主要通过 `CHUNK_MAX_NUM_FRAMES` 控制切片阶段的帧数。`STREAM_QUERY_MODE=chunk` 表示每个 chunk 的所有帧先流式写入 KV，再在 chunk 末尾生成一次答案；如需恢复逐帧生成，可设置 `STREAM_QUERY_MODE=frame`。
 
 ### `MODEL_VARIANT=sw_ssm`
 
-该模式使用 `qwen_vsr_sliding_window_ssm`，并自动设置：
-
-```bash
-CAMBRIAN_USE_SSM_MODEL=1
-```
+该模式使用 `qwen_vsr_sliding_window_ssm`。它保留原生 `Qwen2_5_VLForConditionalGeneration`，在加载后 patch decoder layers：滑动窗口淘汰旧视觉 KV 前先写入 SSM compressor，后续每层 self-attention 后通过 SSM fusion 读回压缩历史。
 
 常用覆盖参数：
 
 ```bash
-CONV_TEMPLATE=qwen_2
-NUM_FRAMES=1
+NUM_FRAMES=-1
 MIV_TOKEN_LEN=64
 SI_TOKEN_LEN=729
 SENSORY_WINDOW_SIZE=140
-ENABLE_VISUAL_FEATURE_CACHING=True
+SLIDING_WINDOW_STRIDE=70
+SENSORY_WINDOW_MAX_TOKENS=0
+STREAM_VISUAL_MICRO_BATCH_SIZE=1
+STREAM_QUERY_MODE=chunk
+SSM_D_STATE=64
+SSM_MAX_MEMORY_LEN=256
+SSM_FUSION_NUM_HEADS=8
+SSM_FUSION_BOTTLENECK=256
+SSM_LAYER_SHARING=group4
 ```
 
-除非明确跳过兼容性检查，否则该模式应使用 Cambrian-S 风格的多模态 checkpoint。
+注意：当前 SSM fusion 新增的参数是随机初始化的机制参数；如果要追求准确率，需要针对该机制继续训练或微调。未训练时更适合先用于链路验证和效率实验。
 
 ## 单视频调试
 
