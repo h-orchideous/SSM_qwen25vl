@@ -1,8 +1,13 @@
-# 使用 Qwen2.5-VL 评测 VSR
+# 使用 Qwen2.5-VL 评测 VSR / VSC
 
-本文档说明如何使用 `scripts/vsr_qwen25vl.sh` 在本地 VSR 任务上评测 Qwen2.5-VL，以及如何切换不同长视频处理机制。
+本文档说明如何使用 Qwen2.5-VL 在本地 VSR 和 VSC 任务上进行评测，以及如何切换不同长视频处理机制。
 
-当前脚本支持三种评测模式：
+| 任务 | 入口脚本 | 默认任务 | 数据集根目录 |
+| ---- | ---- | ---- | ---- |
+| VSR | `scripts/vsr_qwen25vl.sh` | `vsr_local_10mins` | `/data1/ZhangHuayu/datasets/VSI-SUPER-Recall` |
+| VSC | `scripts/vsc_qwen25vl.sh` | `qwen_vsc_streaming_local_10mins` | `/data1/ZhangHuayu/datasets/VSI-SUPER-Count` |
+
+VSR 和 VSC 都支持三种评测模式：
 
 | `MODEL_VARIANT` | lmms-eval 模型名                | 机制                                          | 默认 checkpoint                                     |
 | ----------------- | ------------------------------- | --------------------------------------------- | --------------------------------------------------- |
@@ -323,10 +328,23 @@ MODEL_VARIANT=sw_ssm bash scripts/vsc_qwen25vl.sh
 scripts/vsc_chunk_settings.sh
 ```
 
+脚本会设置 VSC 数据集根目录：
+
+```bash
+export VSI_SUPER_COUNT_ROOT="/data1/ZhangHuayu/datasets/VSI-SUPER-Count"
+```
+
 默认任务是：
 
 ```bash
 qwen_vsc_streaming_local_10mins
+```
+
+可以通过 `TASK_SUFFIX` 切换不同长度 split：
+
+```bash
+TASK_SUFFIX=30mins MODEL_VARIANT=sw bash scripts/vsc_qwen25vl.sh
+TASK_SUFFIX=60mins MODEL_VARIANT=sw_ssm bash scripts/vsc_qwen25vl.sh
 ```
 
 可用任务 YAML 位于 `lmms_eval/tasks/qwen_vsc_streaming_local/`：
@@ -348,6 +366,14 @@ qwen_vsc_streaming_local_240mins
 | `sw_ssm` | `qwen_vsc_sliding_window_ssm` | 滑动窗口 KV + SSM 历史压缩读回 |
 
 当前 VSC 先作为推理效率评测使用。由于长视频被切分为多个 chunk，并在 chunk 级别触发查询，模型没有完整全局计数上下文，因此 VSC accuracy 只作为日志参考，不作为当前实验主要结论。
+
+VSC 的默认输出目录：
+
+| 模式 | 性能日志目录 | lmms-eval 输出目录 |
+| ---- | ---- | ---- |
+| `vl` | `logs/vsc/qwen/perf_qwen25vl` | `logs/vsc/qwen/output_qwen25vl` |
+| `sw` | `logs/vsc/qwen/perf_sw` | `logs/vsc/qwen/output_sw` |
+| `sw_ssm` | `logs/vsc/qwen/perf_sw_ssm` | `logs/vsc/qwen/output_sw_ssm` |
 
 重点记录这些效率指标：
 
