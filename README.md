@@ -306,6 +306,69 @@ MODEL_VARIANT=sw_ssm bash scripts/vsr_qwen25vl.sh
 - 各 `output_*` 目录：lmms-eval 的预测样本与准确率结果。
 - `gpu.csv`：GPU 利用率、显存峰值和功耗。
 
+## VSC 效率评测
+
+VSC 使用独立的 Qwen2.5-VL 评测链路，不复用 VSR wrapper。入口脚本是：
+
+```bash
+cd /home/ZhangHuayu/Workspace/cambrian-s/lmms-eval
+MODEL_VARIANT=vl bash scripts/vsc_qwen25vl.sh
+MODEL_VARIANT=sw bash scripts/vsc_qwen25vl.sh
+MODEL_VARIANT=sw_ssm bash scripts/vsc_qwen25vl.sh
+```
+
+共享切片配置位于：
+
+```bash
+scripts/vsc_chunk_settings.sh
+```
+
+默认任务是：
+
+```bash
+qwen_vsc_streaming_local_10mins
+```
+
+可用任务 YAML 位于 `lmms_eval/tasks/qwen_vsc_streaming_local/`：
+
+```text
+qwen_vsc_streaming_local_10mins
+qwen_vsc_streaming_local_30mins
+qwen_vsc_streaming_local_60mins
+qwen_vsc_streaming_local_120mins
+qwen_vsc_streaming_local_240mins
+```
+
+三种模式对应关系：
+
+| `MODEL_VARIANT` | lmms-eval 模型名 | 机制 |
+| ---- | ---- | ---- |
+| `vl` | `qwen2_5_vl_vsc` | Qwen2.5-VL 原生推理，按 chunk 读取视频 |
+| `sw` | `qwen_vsc_sliding_window` | Qwen2.5-VL 滑动窗口 KV，旧视觉 KV 按窗口裁掉 |
+| `sw_ssm` | `qwen_vsc_sliding_window_ssm` | 滑动窗口 KV + SSM 历史压缩读回 |
+
+当前 VSC 先作为推理效率评测使用。由于长视频被切分为多个 chunk，并在 chunk 级别触发查询，模型没有完整全局计数上下文，因此 VSC accuracy 只作为日志参考，不作为当前实验主要结论。
+
+重点记录这些效率指标：
+
+- `summary.txt` 中的 `seconds`、`samples`、`throughput_sps`、`sec_per_sample`、`exit_status`。
+- `eval.log` 中每个 chunk 的 `generate_s`、`chunk_index`、`kept_frames`、`dropped_frames`。
+- `gpu.csv` 中的显存峰值、平均 GPU 利用率和功耗。
+- `metrics.csv` 中多次运行的耗时和吞吐汇总。
+
+VSC 默认关闭数据集 `query_times` 的全视频计数查询路径，即：
+
+```bash
+VSC_USE_QUERY_TIMES=0
+VSC_MAX_NEW_TOKENS=64
+```
+
+这样三种模式都会按 chunk 级别做效率统计，避免在 VSC 计数任务里把 accuracy 与机制效率混在一起。如果后续需要恢复按 `query_times` 的准确率评测，可显式设置：
+
+```bash
+VSC_USE_QUERY_TIMES=1 MODEL_VARIANT=sw_ssm bash scripts/vsc_qwen25vl.sh
+```
+
 ## 常见问题
 
 `current transformers lacks Qwen2_5_VLForConditionalGeneration`

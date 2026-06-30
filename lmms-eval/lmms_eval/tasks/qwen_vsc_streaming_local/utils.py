@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 from collections import OrderedDict
 
@@ -187,6 +188,35 @@ def mean_relative_accuracy(pred, target, start, end, interval):
     return accuracy
 
 
+def _parse_prediction_values(prediction):
+    if prediction is None:
+        return []
+
+    if isinstance(prediction, list):
+        return prediction
+
+    text = str(prediction).strip()
+    if not text:
+        return []
+
+    try:
+        loaded = json.loads(text)
+        if isinstance(loaded, list):
+            return loaded
+        if isinstance(loaded, (int, float)):
+            return [loaded]
+    except json.JSONDecodeError:
+        pass
+
+    values = []
+    for match in re.findall(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text):
+        try:
+            values.append(float(match))
+        except ValueError:
+            continue
+    return values
+
+
 def process_results(doc, results):
     base_dir = os.getenv("VSI_SUPER_COUNT_ROOT", "")
     video_path = doc["video_path"]
@@ -195,7 +225,11 @@ def process_results(doc, results):
     video_path = os.path.normpath(video_path)
 
     doc["prediction"] = results[0]
-    values = json.loads(results[0])
+    values = _parse_prediction_values(results[0])
+    if not values:
+        eval_logger.warning(
+            f"[qwen_vsc_task] failed to parse prediction as JSON/numeric values. video={doc.get('video_path', '')} prediction={str(results[0])[:120]!r}"
+        )
 
     accs = []
     for streaming_output, answer in zip(values, doc["answers"]):
@@ -213,8 +247,11 @@ def aggregate_results(docs):
     for doc in docs:
         accs.extend(doc["accuracy"])
 
-    accuracy = sum(accs) / len(accs) * 100.0
-    accuracy = accuracy.mean().item()
+    if accs:
+        accuracy = sum(accs) / len(accs) * 100.0
+        accuracy = accuracy.mean().item()
+    else:
+        accuracy = 0.0
 
     outputs = OrderedDict()
     outputs["Overall"] = accuracy
