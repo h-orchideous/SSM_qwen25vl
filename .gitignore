@@ -2,6 +2,8 @@ wandb/
 serve_images/
 
 eval/logs
+lmms-eval/logs/
+lmms-eval/.cache/
 eval/**/*.out
 eval/**/*.err
 eval/**/*.jsonl
