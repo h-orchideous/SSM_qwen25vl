@@ -1,6 +1,7 @@
 import math
 import os
 import subprocess
+import fcntl
 from dataclasses import dataclass
 from typing import Optional
 
@@ -107,68 +108,131 @@ def materialize_chunk_visual(
     chunk_name = f"chunk_{chunk_index:04d}_{int(start_sec * 1000):010d}_{int(end_sec * 1000):010d}.mp4"
     chunk_path = os.path.join(chunk_dir, chunk_name)
 
-    if not os.path.exists(chunk_path):
-        copy_cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
+    def _is_decodable(path: str) -> bool:
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            return False
+        probe_cmd = [
+            "ffprobe",
+            "-v",
             "error",
-            "-y",
-            "-ss",
-            f"{start_sec:.3f}",
-            "-t",
-            f"{clip_duration:.3f}",
-            "-i",
-            video_path,
-            "-c",
-            "copy",
-            chunk_path,
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=pix_fmt,codec_name,width,height",
+            "-of",
+            "csv=p=0",
+            path,
         ]
-        reencode_cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-ss",
-            f"{start_sec:.3f}",
-            "-t",
-            f"{clip_duration:.3f}",
-            "-i",
-            video_path,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            chunk_path,
-        ]
+        probe = subprocess.run(probe_cmd, capture_output=True, text=True)
+        if probe.returncode != 0:
+            return False
+        fields = [part.strip() for part in (probe.stdout or "").strip().split(",")]
+        if len(fields) < 4 or "unknown" in fields:
+            return False
+        decode_cmd = ["ffmpeg", "-v", "error", "-i", path, "-frames:v", "1", "-f", "null", "-"]
+        return subprocess.run(decode_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True).returncode == 0
 
-        primary_cmd = reencode_cmd if encode_mode == "reencode" else copy_cmd
-        fallback_mode = None
-        fallback_cmd = None
-        if encode_mode == "reencode":
-            fallback_mode, fallback_cmd = "copy", copy_cmd
-        elif encode_mode in {"copy", "auto"}:
-            fallback_mode, fallback_cmd = "reencode", reencode_cmd
-
-        try:
-            subprocess.run(primary_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        except subprocess.CalledProcessError as exc:
-            stderr_msg = exc.stderr.strip() if exc.stderr else ""
-            if fallback_cmd is None:
-                raise
+    lock_path = f"{chunk_path}.lock"
+    with open(lock_path, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        if os.path.exists(chunk_path) and not _is_decodable(chunk_path):
             eval_logger.warning(
-                f"[{log_prefix} chunk] ffmpeg {encode_mode} failed, fallback to {fallback_mode}. video={os.path.basename(video_path)} start={start_sec:.2f}s end={end_sec:.2f}s err={stderr_msg}"
+                f"[{log_prefix} chunk] remove invalid chunk before rematerializing. clip={os.path.basename(chunk_path)}"
             )
-            subprocess.run(fallback_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            try:
+                os.remove(chunk_path)
+            except OSError:
+                pass
+
+        if os.path.exists(chunk_path):
+            pass
+        else:
+            tmp_chunk_path = f"{chunk_path}.tmp.{os.getpid()}.mp4"
+            copy_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                f"{start_sec:.3f}",
+                "-t",
+                f"{clip_duration:.3f}",
+                "-i",
+                video_path,
+                "-c",
+                "copy",
+                tmp_chunk_path,
+            ]
+            reencode_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                f"{start_sec:.3f}",
+                "-t",
+                f"{clip_duration:.3f}",
+                "-i",
+                video_path,
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                tmp_chunk_path,
+            ]
+
+            primary_cmd = reencode_cmd if encode_mode == "reencode" else copy_cmd
+            fallback_mode = None
+            fallback_cmd = None
+            if encode_mode == "reencode":
+                fallback_mode, fallback_cmd = "copy", copy_cmd
+            elif encode_mode in {"copy", "auto"}:
+                fallback_mode, fallback_cmd = "reencode", reencode_cmd
+
+            try:
+                subprocess.run(primary_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            except subprocess.CalledProcessError as exc:
+                stderr_msg = exc.stderr.strip() if exc.stderr else ""
+                if fallback_cmd is None:
+                    raise
+                eval_logger.warning(
+                    f"[{log_prefix} chunk] ffmpeg {encode_mode} failed, fallback to {fallback_mode}. video={os.path.basename(video_path)} start={start_sec:.2f}s end={end_sec:.2f}s err={stderr_msg}"
+                )
+                try:
+                    subprocess.run(fallback_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                except subprocess.CalledProcessError as fallback_exc:
+                    fallback_stderr = fallback_exc.stderr.strip() if fallback_exc.stderr else ""
+                    eval_logger.warning(
+                        f"[{log_prefix} chunk] ffmpeg fallback {fallback_mode} failed. video={os.path.basename(video_path)} start={start_sec:.2f}s end={end_sec:.2f}s err={fallback_stderr}"
+                    )
+                    try:
+                        os.remove(tmp_chunk_path)
+                    except OSError:
+                        pass
+                    return None
+
+            if not _is_decodable(tmp_chunk_path):
+                eval_logger.warning(
+                    f"[{log_prefix} chunk] materialized chunk is not decodable; skip. video={os.path.basename(video_path)} start={start_sec:.2f}s end={end_sec:.2f}s clip={os.path.basename(chunk_path)}"
+                )
+                try:
+                    os.remove(tmp_chunk_path)
+                except OSError:
+                    pass
+                return None
+
+            os.replace(tmp_chunk_path, chunk_path)
 
     try:
         probe_cmd = [

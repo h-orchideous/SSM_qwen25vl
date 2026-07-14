@@ -22,7 +22,6 @@ from transformers import (
     AutoTokenizer,
     Qwen2_5_VLForConditionalGeneration,
 )
-from transformers.cache_utils import DynamicCache
 
 from lmms_eval import utils
 from lmms_eval.api.instance import Instance
@@ -104,7 +103,7 @@ class Qwen_VSR_SlidingWindow(lmms):
         self.enable_visual_feature_caching = bool(enable_visual_feature_caching)
         self.conv_template = conv_template
         self.sensory_window_size = int(sliding_window_size) if sliding_window_size is not None else int(sensory_window_size)
-        self.sliding_window_stride = int(sliding_window_stride) if sliding_window_stride is not None else max(1, self.sensory_window_size // 2)
+        self.sliding_window_stride = int(sliding_window_stride) if sliding_window_stride is not None else 1
         self.sensory_window_max_tokens = None if sensory_window_max_tokens is None or int(sensory_window_max_tokens) <= 0 else int(sensory_window_max_tokens)
         self.stream_visual_micro_batch_size = max(1, int(stream_visual_micro_batch_size))
         self.stream_query_mode = str(stream_query_mode).lower()
@@ -334,333 +333,34 @@ class Qwen_VSR_SlidingWindow(lmms):
 
         return list(range(total_frames))
 
-    def _normalize_past_key_values(self, past_key_values):
-        if past_key_values is None:
-            return []
+    def _generate_with_recent_frames(self, context: str, recent_frames: List[Image.Image], current_gen_kwargs: dict) -> str:
+        if not recent_frames:
+            return ""
 
-        if hasattr(past_key_values, "to_legacy_cache"):
-            past_key_values = past_key_values.to_legacy_cache()
-
-        normalized = []
-        for layer_cache in past_key_values:
-            if hasattr(layer_cache, "to_legacy_cache"):
-                layer_cache = layer_cache.to_legacy_cache()
-
-            if isinstance(layer_cache, tuple) and len(layer_cache) == 2 and torch.is_tensor(layer_cache[0]):
-                normalized.append(layer_cache)
-                continue
-
-            if isinstance(layer_cache, (list, tuple)) and len(layer_cache) == 1 and isinstance(layer_cache[0], tuple):
-                normalized.append(layer_cache[0])
-                continue
-
-            raise ValueError(f"Unexpected layer cache structure: type={type(layer_cache)}")
-
-        return normalized
-
-    def _prepare_stream_prompt_tokens(self, context: str, reference_frame: Image.Image):
-        probe_visual = {
+        video_visual = {
             "type": "video",
-            "video": [reference_frame],
+            "video": [frame.convert("RGB") for frame in recent_frames],
             "max_pixels": self.max_pixels,
             "min_pixels": self.min_pixels,
         }
-        probe_message = self._build_message(context, [probe_visual])
-        probe_text = self.processor.apply_chat_template(probe_message, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info([probe_message])
-        probe_inputs = self.processor(text=[probe_text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
-        input_ids = probe_inputs["input_ids"][0]
+        if self.fps is not None:
+            video_visual["sample_fps"] = float(self.fps)
 
-        # Qwen2.5-VL special token ids from tokenizer added vocab.
-        video_token_id = 151656  # <|video_pad|>
-        video_positions = (input_ids == video_token_id).nonzero(as_tuple=False).flatten()
-        if video_positions.numel() == 0:
-            raise ValueError("Failed to locate <|video_pad|> region for streaming prompt split")
-
-        first_pad = int(video_positions[0].item())
-        last_pad = int(video_positions[-1].item())
-        pre_tokens = input_ids[:first_pad].unsqueeze(0)
-        post_tokens = input_ids[last_pad + 1 :].unsqueeze(0)
-        return pre_tokens, post_tokens
-
-    def _encode_single_frame_embedding(self, frame: Image.Image):
-        batch = self.processor(text=[""], images=[frame.convert("RGB")], padding=True, return_tensors="pt")
-        pixel_values = batch["pixel_values"].to(self.device, dtype=self.model.visual.dtype)
-        image_grid_thw = batch["image_grid_thw"].to(self.device)
-
-        image_embeds = self.model.visual(pixel_values, grid_thw=image_grid_thw)
-        grid = image_grid_thw[0].tolist()
-        token_count = int(grid[0] * grid[1] * grid[2])
-        return image_embeds[:token_count].unsqueeze(0)
-
-    def _cache_seq_len(self, cache_obj) -> int:
-        if hasattr(cache_obj, "get_seq_length"):
-            return int(cache_obj.get_seq_length())
-        legacy = self._normalize_past_key_values(cache_obj)
-        if not legacy:
-            return 0
-        return int(legacy[0][0].size(2))
-
-    def _trim_dynamic_cache_visual_prefix(self, cache_obj, prefix_len: int, drop_tokens: int):
-        if drop_tokens <= 0:
-            return cache_obj
-
-        legacy = self._normalize_past_key_values(cache_obj)
-        trimmed = []
-        for key_states, value_states in legacy:
-            seq_len = key_states.size(2)
-            drop_end = min(seq_len, prefix_len + drop_tokens)
-            if drop_end <= prefix_len:
-                trimmed.append((key_states, value_states))
-                continue
-
-            trimmed_key = torch.cat([key_states[..., :prefix_len, :], key_states[..., drop_end:, :]], dim=2)
-            trimmed_value = torch.cat([value_states[..., :prefix_len, :], value_states[..., drop_end:, :]], dim=2)
-            trimmed.append((trimmed_key, trimmed_value))
-
-        return DynamicCache.from_legacy_cache(trimmed)
-
-    def _clone_cache(self, cache_obj):
-        legacy = self._normalize_past_key_values(cache_obj)
-        if not legacy:
-            return cache_obj
-
-        cloned = []
-        for key_states, value_states in legacy:
-            cloned.append((key_states.clone(), value_states.clone()))
-
-        return DynamicCache.from_legacy_cache(cloned)
-
-    def _decode_with_past_key_values(self, past_key_values, post_tokens: torch.Tensor, current_gen_kwargs: dict):
-        if post_tokens.size(1) == 0:
-            eval_logger.warning(f"[{self.log_prefix} kv] empty post_tokens encountered; fallback to one pad token for decoding bootstrap")
-            post_tokens = torch.full(
-                (1, 1),
-                self.tokenizer.pad_token_id,
-                dtype=torch.long,
-                device=self.device,
-            )
-
-        def _sample_next_token(logits: torch.Tensor) -> torch.Tensor:
-            if not current_gen_kwargs["do_sample"]:
-                return torch.argmax(logits, dim=-1)
-
-            temperature = current_gen_kwargs.get("temperature")
-            top_p = current_gen_kwargs.get("top_p")
-
-            if temperature is not None and temperature > 0:
-                logits = logits / float(temperature)
-
-            probs = torch.softmax(logits, dim=-1)
-            if top_p is not None and 0 < float(top_p) < 1:
-                sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-                cum_probs = torch.cumsum(sorted_probs, dim=-1)
-                sorted_mask = cum_probs > float(top_p)
-                sorted_mask[..., 0] = False
-                sorted_probs = sorted_probs.masked_fill(sorted_mask, 0.0)
-                sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-                sampled_idx = torch.multinomial(sorted_probs, num_samples=1)
-                return sorted_indices.gather(-1, sampled_idx).squeeze(-1)
-
-            return torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-        if int(current_gen_kwargs.get("num_beams", 1)) != 1:
-            eval_logger.warning(f"[{self.log_prefix} kv] num_beams>1 is not supported in incremental manual decode, falling back to greedy/sampling with num_beams=1")
-
-        out = self.model(
-            input_ids=post_tokens,
-            inputs_embeds=None,
-            attention_mask=None,
-            position_ids=None,
-            use_cache=True,
-            return_dict=True,
-            past_key_values=past_key_values,
-            output_attentions=False,
-            output_hidden_states=False,
-        )
-        past_key_values = out.past_key_values
-        logits = out.logits[:, -1, :]
-        pred = _sample_next_token(logits)
-        generated = [pred]
-
-        max_new_tokens = int(current_gen_kwargs["max_new_tokens"])
-        for _ in range(max_new_tokens - 1):
-            if int(pred.item()) == int(self.tokenizer.eos_token_id):
-                break
-            out = self.model(
-                input_ids=pred[:, None],
-                inputs_embeds=None,
-                attention_mask=None,
-                position_ids=None,
-                use_cache=True,
-                return_dict=True,
-                past_key_values=past_key_values,
-                output_attentions=False,
-                output_hidden_states=False,
-            )
-            past_key_values = out.past_key_values
-            logits = out.logits[:, -1, :]
-            pred = _sample_next_token(logits)
-            generated.append(pred)
-
-        output_ids = torch.stack(generated, dim=1)
-        return self.processor.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-
-    def _generate_with_incremental_kv(self, context: str, sampled_frames: List[Image.Image], current_gen_kwargs: dict, chunk_idx: int):
-        if not sampled_frames:
-            return "", 0, 0, 0
-
-        with torch.inference_mode():
-            pre_tokens, post_tokens = self._prepare_stream_prompt_tokens(context, sampled_frames[0])
-            pre_tokens = pre_tokens.to(self.device)
-            post_tokens = post_tokens.to(self.device)
-
-            prefix_out = self.model(
-                input_ids=pre_tokens,
-                inputs_embeds=None,
-                attention_mask=None,
-                position_ids=None,
-                past_key_values=None,
-                use_cache=True,
-                output_attentions=False,
-                output_hidden_states=False,
-                return_dict=True,
-            )
-
-            prefix_cache = self._normalize_past_key_values(prefix_out.past_key_values)
-            prefix_len = int(prefix_cache[0][0].size(2)) if prefix_cache else 0
-
-            past_key_values = prefix_out.past_key_values
-            frame_token_lengths: deque = deque()
-            evicted_frames = 0
-            query_count = 0
-            window_answers: List[str] = []
-            window_size = max(1, int(self.sensory_window_size))
-
-            for frame_idx, frame in enumerate(sampled_frames):
-                prev_seq_len = self._cache_seq_len(past_key_values)
-                frame_embeds = self._encode_single_frame_embedding(frame)
-                frame_input_ids = torch.full(
-                    (frame_embeds.size(0), frame_embeds.size(1)),
-                    self.tokenizer.pad_token_id,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-
-                frame_out = self.model(
-                    input_ids=frame_input_ids,
-                    inputs_embeds=frame_embeds,
-                    attention_mask=None,
-                    position_ids=None,
-                    use_cache=True,
-                    return_dict=True,
-                    past_key_values=past_key_values,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                )
-                past_key_values = frame_out.past_key_values
-                new_seq_len = self._cache_seq_len(past_key_values)
-                frame_tokens = max(0, int(new_seq_len - prev_seq_len))
-                frame_token_lengths.append(frame_tokens)
-
-                # FIFO sliding: when the window overflows, drop only the oldest frame's KV.
-                if len(frame_token_lengths) > window_size:
-                    drop_tokens = frame_token_lengths.popleft()
-                    evicted_frames += 1
-                    if drop_tokens > 0:
-                        past_key_values = self._trim_dynamic_cache_visual_prefix(
-                            past_key_values,
-                            prefix_len=prefix_len,
-                            drop_tokens=drop_tokens,
-                        )
-
-                if self.stream_query_mode == "frame":
-                    query_cache = self._clone_cache(past_key_values)
-                    window_answer = self._decode_with_past_key_values(query_cache, post_tokens, current_gen_kwargs)
-                    window_answers.append(window_answer)
-                    query_count += 1
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            if len(frame_token_lengths) == 0:
-                return "", 0, 0, 0
-
-            if self.stream_query_mode == "chunk":
-                query_cache = self._clone_cache(past_key_values)
-                chunk_ans = self._decode_with_past_key_values(query_cache, post_tokens, current_gen_kwargs)
-                query_count = 1
-            else:
-                chunk_ans = self._aggregate_window_answers(window_answers)
-            kept_frames = len(frame_token_lengths)
-            return chunk_ans, kept_frames, evicted_frames, query_count
-
-    def _encode_stream_video_features(self, video_paths: List[str]):
-        sampled_frames = []
-        chunk_frame_counts = []
-        for video_path in video_paths:
-            chunk_frames = self._sample_video_frames(video_path)
-            sampled_frames.extend(chunk_frames)
-            chunk_frame_counts.append(len(chunk_frames))
-
-        if not sampled_frames:
-            return None, [], []
-
-        if self.max_image_size is not None:
-            resized_frames = []
-            for frame in sampled_frames:
-                width, height = frame.size
-                longest_edge = max(width, height)
-                if longest_edge > self.max_image_size:
-                    scale = self.max_image_size / float(longest_edge)
-                    resized_frames.append(
-                        frame.resize((max(1, int(round(width * scale))), max(1, int(round(height * scale)))), Image.Resampling.BICUBIC)
-                    )
-                else:
-                    resized_frames.append(frame)
-            sampled_frames = resized_frames
-
-        frame_features = []
-        token_lengths = []
-
-        sampled_frames_rgb = [frame.convert("RGB") for frame in sampled_frames]
-        with torch.inference_mode():
-            for batch_start in range(0, len(sampled_frames_rgb), self.stream_visual_micro_batch_size):
-                frame_batch = sampled_frames_rgb[batch_start : batch_start + self.stream_visual_micro_batch_size]
-                batch = self.processor(text=[""] * len(frame_batch), images=frame_batch, padding=True, return_tensors="pt")
-                pixel_values = batch["pixel_values"].to(self.device, dtype=self.model.visual.dtype)
-                image_grid_thw = batch["image_grid_thw"].to(self.device)
-
-                image_embeds = self.model.visual(pixel_values, grid_thw=image_grid_thw)
-
-                cursor = 0
-                for grid in image_grid_thw.tolist():
-                    token_count = int(grid[0] * grid[1] * grid[2])
-                    # Keep encoded frame features on CPU to avoid accumulating all visual embeddings on GPU.
-                    frame_features.append(image_embeds[cursor : cursor + token_count].unsqueeze(0).to("cpu"))
-                    token_lengths.append(token_count)
-                    cursor += token_count
-
-                del batch, pixel_values, image_grid_thw, image_embeds
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-        if token_lengths:
-            eval_logger.info(
-                f"[{self.log_prefix} visual] frames={len(token_lengths)} max_frame_tokens={max(token_lengths)} avg_frame_tokens={(sum(token_lengths) / len(token_lengths)):.1f} micro_batch={self.stream_visual_micro_batch_size}"
-            )
-
-        return frame_features, token_lengths, chunk_frame_counts
+        message = self._build_message(context, [video_visual])
+        return self._generate_for_messages([message], current_gen_kwargs, debug_label="simplestream_window")[0]
 
     def _run_streaming_video(self, context: str, static_visuals: List[dict], video_paths: List[str], current_gen_kwargs: dict, until: List[str]):
         if static_visuals:
-            raise NotImplementedError(f"[{self.log_prefix}] streaming sw currently supports video-only requests")
+            raise NotImplementedError(f"[{self.log_prefix}] simplestream sw currently supports video-only requests")
 
         if not video_paths:
             return ""
 
-        total_generate_elapsed = 0.0
-        chunk_answers = []
+        window_size = max(1, int(self.sensory_window_size))
+        recent_frames = deque(maxlen=window_size)
+        sampled_count = 0
+        evicted_frames = 0
+        chunk_count = 0
 
         for chunk_idx, chunk_path in enumerate(video_paths):
             try:
@@ -673,15 +373,12 @@ class Qwen_VSR_SlidingWindow(lmms):
             if total_frames <= 0:
                 continue
 
-            # Strictly follow configured video_fps for streaming sampling.
             sample_indices = self._build_sample_indices(vr, total_frames, target_fps=self.fps)
             if not sample_indices:
                 continue
 
-            chunk_generate_elapsed = 0.0
-            sampled_count = 0
-            sampled_frames = []
-
+            chunk_sampled = 0
+            chunk_dropped = 0
             for frame_idx in sample_indices:
                 try:
                     frame = Image.fromarray(vr[frame_idx].asnumpy()).convert("RGB")
@@ -701,49 +398,35 @@ class Qwen_VSR_SlidingWindow(lmms):
                             Image.Resampling.BICUBIC,
                         )
 
-                sampled_frames.append(frame)
+                if len(recent_frames) == window_size:
+                    evicted_frames += 1
+                    chunk_dropped += 1
+                recent_frames.append(frame)
                 sampled_count += 1
+                chunk_sampled += 1
 
-            if sampled_count == 0:
-                continue
-
-            generate_start = time.perf_counter()
-            try:
-                chunk_ans, kept_frames, evicted_frames, query_count = self._generate_with_incremental_kv(
-                    context,
-                    sampled_frames,
-                    current_gen_kwargs,
-                    chunk_idx,
+            if chunk_sampled > 0:
+                chunk_count += 1
+                eval_logger.info(
+                    f"[{self.log_prefix} chunk] chunk_index={chunk_idx + 1}/{len(video_paths)} chunk_frames={chunk_sampled} kept_frames={len(recent_frames)} dropped_frames={chunk_dropped} queries=0 query_mode=final input_fps={self.fps} window_mode=simplestream"
                 )
-            except ValueError as exc:
-                if "nframes should in interval" in str(exc):
-                    eval_logger.warning(
-                        f"[{self.log_prefix} chunk] skip invalid frame-stream chunk. video={chunk_path} err={exc}"
-                    )
-                    continue
-                raise
 
-            generate_elapsed = time.perf_counter() - generate_start
-            chunk_generate_elapsed += generate_elapsed
-            total_generate_elapsed += generate_elapsed
-
-            for term in until:
-                if len(term) > 0:
-                    chunk_ans = chunk_ans.split(term)[0]
-
-            chunk_answers.append(chunk_ans)
-            eval_logger.info(
-                f"[{self.log_prefix} chunk] chunk_index={chunk_idx + 1}/{len(video_paths)} chunk_frames={sampled_count} kept_frames={kept_frames} dropped_frames={evicted_frames} queries={query_count} query_mode={self.stream_query_mode} input_fps={self.fps} kv_mode=frame_stream generate_s={chunk_generate_elapsed:.3f}"
-            )
-
-        if not chunk_answers:
+        if not recent_frames:
             return ""
-        answer = self._aggregate_chunk_answers(chunk_answers)
+
+        generate_start = time.perf_counter()
+        answer = self._generate_with_recent_frames(context, list(recent_frames), current_gen_kwargs)
+        generate_elapsed = time.perf_counter() - generate_start
+
+        for term in until:
+            if len(term) > 0:
+                answer = answer.split(term)[0]
+
         eval_logger.info(
-            f"[{self.log_prefix} stream] chunks={len(chunk_answers)} total_generate_s={total_generate_elapsed:.3f} avg_generate_s={(total_generate_elapsed / len(chunk_answers)):.3f}"
-            if chunk_answers
-            else f"[{self.log_prefix} stream] chunks=0 total_generate_s={total_generate_elapsed:.3f}"
+            f"[{self.log_prefix} stream] chunks={chunk_count} sampled_frames={sampled_count} kept_frames={len(recent_frames)} dropped_frames={evicted_frames} queries=1 window_mode=simplestream generate_s={generate_elapsed:.3f}"
         )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return answer
 
     def _build_message(self, context: str, visuals: List[dict]):

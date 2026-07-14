@@ -2,20 +2,21 @@
 set -euo pipefail
 
 # Unified VSR benchmark launcher.
-# MODEL_VARIANT=vl      -> qwen2_5_vl
-# MODEL_VARIANT=sw      -> qwen_vsr_sliding_window
-# MODEL_VARIANT=sw_ssm  -> qwen_vsr_sliding_window_ssm
+# MODEL_VARIANT=vl   -> qwen2_5_vl, chunked native Qwen2.5-VL inference
+# MODEL_VARIANT=sw   -> qwen_vsr_sliding_window, SimpleStream recent-N raw-frame window
+# MODEL_VARIANT=ssm  -> qwen_vsr_sliding_window_ssm, SimpleStream window + SSM-compressed evicted frames
 # Logs: GPU utilization (nvidia-smi), wall time, throughput, avg time per sample.
 
 MODEL_VARIANT=${MODEL_VARIANT:-vl}
 GPU_LOG_INTERVAL=${GPU_LOG_INTERVAL:-5}
 
+LAUNCH_CWD=$(pwd)
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 PROJECT_ROOT=$(cd -- "$REPO_ROOT/.." && pwd)
 
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
-    export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+    export CUDA_VISIBLE_DEVICES=0,1,2,3
 fi
 
 export DECORD_EOF_RETRY_MAX=20480
@@ -57,35 +58,35 @@ else
 fi
 
 case "$MODEL_VARIANT" in
-    vl|qwen25vl)
+    vl)
         model_family_default="qwen2_5_vl"
-        log_root_default="logs/vsr/qwen/perf_qwen25vl"
-        output_root_default="logs/vsr/qwen/output_qwen25vl"
+        log_root_default="logs/vsr_eval_runs/perf_vl"
+        output_root_default="logs/vsr_eval_runs/output_vl"
         log_suffix_default="qwen25vl"
         main_process_port_default=29510
         checkpoint_default="/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct"
         force_simple_default=1
         ;;
-    sw|qwen25_sw)
+    sw)
         model_family_default="qwen_vsr_sliding_window"
-        log_root_default="logs/vsr/qwen/perf_sw"
-        output_root_default="logs/vsr/qwen/output_sw"
+        log_root_default="logs/vsr_eval_runs/perf_sw"
+        output_root_default="logs/vsr_eval_runs/output_sw"
         log_suffix_default="qwen_sw"
         main_process_port_default=29500
         checkpoint_default="/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct"
         force_simple_default=0
         ;;
-    sw_ssm|qwen25_sw_ssm)
+    ssm)
         model_family_default="qwen_vsr_sliding_window_ssm"
-        log_root_default="logs/vsr/qwen/perf_sw_ssm"
-        output_root_default="logs/vsr/qwen/output_sw_ssm"
-        log_suffix_default="qwen_sw_ssm"
+        log_root_default="logs/vsr_eval_runs/perf_ssm"
+        output_root_default="logs/vsr_eval_runs/output_ssm"
+        log_suffix_default="qwen_ssm"
         main_process_port_default=29501
         checkpoint_default="/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct"
         force_simple_default=0
         ;;
     *)
-        echo "[vsr_qwen25] ERROR: unsupported MODEL_VARIANT=$MODEL_VARIANT (expected: vl, sw, sw_ssm)"
+        echo "[vsr_qwen25] ERROR: unsupported MODEL_VARIANT=$MODEL_VARIANT (expected: vl, sw, ssm)"
         exit 2
         ;;
 esac
@@ -94,10 +95,10 @@ LOG_ROOT=${LOG_ROOT:-$log_root_default}
 EVAL_OUTPUT_ROOT=${EVAL_OUTPUT_ROOT:-$output_root_default}
 
 if [[ "$LOG_ROOT" != /* ]]; then
-    LOG_ROOT="$REPO_ROOT/$LOG_ROOT"
+    LOG_ROOT="$LAUNCH_CWD/$LOG_ROOT"
 fi
 if [[ "$EVAL_OUTPUT_ROOT" != /* ]]; then
-    EVAL_OUTPUT_ROOT="$REPO_ROOT/$EVAL_OUTPUT_ROOT"
+    EVAL_OUTPUT_ROOT="$LAUNCH_CWD/$EVAL_OUTPUT_ROOT"
 fi
 
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
@@ -132,14 +133,14 @@ interleave_visuals=${INTERLEAVE_VISUALS:-False}
 use_fast_processor=${USE_FAST_PROCESSOR:-True}
 
 # ---------------------------
-# Sliding-window mode params (MODEL_VARIANT=sw/sw_ssm)
+# Sliding-window mode params (MODEL_VARIANT=sw/ssm)
 # ---------------------------
 conv_template=${CONV_TEMPLATE:-qwen_2}
 num_frames=${NUM_FRAMES:-}
 miv_token_len=${MIV_TOKEN_LEN:-64}
 si_token_len=${SI_TOKEN_LEN:-729}
 sensory_window_size=${SENSORY_WINDOW_SIZE:-140}
-sliding_window_stride=${SLIDING_WINDOW_STRIDE:-}
+sliding_window_stride=${SLIDING_WINDOW_STRIDE:-1}
 enable_visual_feature_caching=${ENABLE_VISUAL_FEATURE_CACHING:-True}
 sensory_window_max_tokens=${SENSORY_WINDOW_MAX_TOKENS:-0}
 stream_visual_micro_batch_size=${STREAM_VISUAL_MICRO_BATCH_SIZE:-1}
@@ -149,14 +150,15 @@ ssm_max_memory_len=${SSM_MAX_MEMORY_LEN:-256}
 ssm_fusion_num_heads=${SSM_FUSION_NUM_HEADS:-8}
 ssm_fusion_bottleneck=${SSM_FUSION_BOTTLENECK:-256}
 ssm_layer_sharing=${SSM_LAYER_SHARING:-group4}
+ssm_fusion_policy=${SSM_FUSION_POLICY:-query_only}
 
 # ---------------------------
 # Shared chunk params (all modes)
 # Defined in scripts/vsr_chunk_settings.sh
 # ---------------------------
-chunk_seconds=${CHUNK_SECONDS:-150}
+chunk_seconds=${CHUNK_SECONDS:-200}
 chunk_overlap_seconds=${CHUNK_OVERLAP_SECONDS:-0}
-chunk_max_num_frames=${CHUNK_MAX_NUM_FRAMES:-150}
+chunk_max_num_frames=${CHUNK_MAX_NUM_FRAMES:-200}
 chunk_encode_mode=${CHUNK_ENCODE_MODE:-copy} #不进行重编码，reencode
 chunk_per_video_flow=${CHUNK_PER_VIDEO_FLOW:-1}
 chunk_temp_mode=${CHUNK_TEMP_MODE:-1}
@@ -164,7 +166,7 @@ keep_chunks=${KEEP_CHUNKS:-0}
 single_video_path=${SINGLE_VIDEO_PATH:-}
 
 if [ -z "${num_frames}" ]; then
-    if [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ] || [ "$MODEL_VARIANT" = "sw_ssm" ] || [ "$MODEL_VARIANT" = "qwen25_sw_ssm" ]; then
+    if [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "ssm" ]; then
         num_frames=-1
         echo "[vsr_qwen25] INFO: NUM_FRAMES not set for sliding-window mode; defaulting to -1 (no per-chunk frame cap)."
     else
@@ -172,10 +174,10 @@ if [ -z "${num_frames}" ]; then
     fi
 fi
 
-if { [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ] || [ "$MODEL_VARIANT" = "sw_ssm" ] || [ "$MODEL_VARIANT" = "qwen25_sw_ssm" ]; } && [ "${num_frames}" -eq 1 ] && [ "${sensory_window_size}" -gt 1 ]; then
+if { [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "ssm" ]; } && [ "${num_frames}" -eq 1 ] && [ "${sensory_window_size}" -gt 1 ]; then
     echo "[vsr_qwen25] WARNING: NUM_FRAMES=1 means each chunk contributes only 1 frame to SW runtime cache."
     echo "[vsr_qwen25] WARNING: with SENSORY_WINDOW_SIZE=${sensory_window_size}, frame-drop sliding is unlikely to trigger unless chunks per video exceed the window size."
-    echo "[vsr_qwen25] HINT: for 150s chunks and 140-frame window, try NUM_FRAMES=-1 (or >=140 with VIDEO_FPS=1)."
+    echo "[vsr_qwen25] HINT: for ${chunk_seconds}s chunks and 140-frame window, try NUM_FRAMES=-1 (or >=140 with VIDEO_FPS=1)."
 fi
 
 TEMP_CHUNK_ROOT_TO_CLEAN=""
@@ -198,18 +200,18 @@ cleanup_temp_chunks() {
 
 trap cleanup_temp_chunks EXIT
 
-if [ "$MODEL_VARIANT" = "vl" ] || [ "$MODEL_VARIANT" = "qwen25vl" ]; then
+if [ "$MODEL_VARIANT" = "vl" ]; then
     # vl: direct video path into qwen2_5_vl with chunk/fps controls.
     model_args_default="pretrained=${checkpoint},min_pixels=${min_pixels},max_pixels=${max_pixels},max_num_frames=${max_num_frames},fps=${video_fps},use_custom_video_loader=${use_custom_video_loader},max_image_size=${max_image_size},attn_implementation=${attn_impl},interleave_visuals=${interleave_visuals},use_fast_processor=${use_fast_processor}"
-elif [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ]; then
-    # sw: raw Qwen2.5-VL sliding-window path.
+elif [ "$MODEL_VARIANT" = "sw" ]; then
+    # sw: SimpleStream recent-N raw-frame sliding-window path.
     model_args_default="pretrained=${checkpoint},min_pixels=${min_pixels},max_pixels=${max_pixels},video_max_frames=${num_frames},video_fps=${video_fps},miv_token_len=${miv_token_len},si_token_len=${si_token_len},sensory_window_size=${sensory_window_size},sensory_window_max_tokens=${sensory_window_max_tokens},stream_visual_micro_batch_size=${stream_visual_micro_batch_size},stream_query_mode=${stream_query_mode},use_custom_video_loader=${use_custom_video_loader},max_image_size=${max_image_size},attn_implementation=${attn_impl},use_fast_processor=${use_fast_processor}"
     if [ -n "$sliding_window_stride" ]; then
         model_args_default+=",sliding_window_stride=${sliding_window_stride}"
     fi
 else
-    # sw_ssm: native Qwen2.5-VL sliding-window path with SSM long-memory fusion.
-    model_args_default="pretrained=${checkpoint},min_pixels=${min_pixels},max_pixels=${max_pixels},video_max_frames=${num_frames},video_fps=${video_fps},miv_token_len=${miv_token_len},si_token_len=${si_token_len},sensory_window_size=${sensory_window_size},sensory_window_max_tokens=${sensory_window_max_tokens},stream_visual_micro_batch_size=${stream_visual_micro_batch_size},stream_query_mode=${stream_query_mode},use_custom_video_loader=${use_custom_video_loader},max_image_size=${max_image_size},attn_implementation=${attn_impl},use_fast_processor=${use_fast_processor},ssm_d_state=${ssm_d_state},ssm_max_memory_len=${ssm_max_memory_len},ssm_fusion_num_heads=${ssm_fusion_num_heads},ssm_fusion_bottleneck=${ssm_fusion_bottleneck},ssm_layer_sharing=${ssm_layer_sharing}"
+    # ssm: SimpleStream raw-frame window with CSMS SSM memory for evicted frames.
+    model_args_default="pretrained=${checkpoint},min_pixels=${min_pixels},max_pixels=${max_pixels},video_max_frames=${num_frames},video_fps=${video_fps},miv_token_len=${miv_token_len},si_token_len=${si_token_len},sensory_window_size=${sensory_window_size},sensory_window_max_tokens=${sensory_window_max_tokens},stream_visual_micro_batch_size=${stream_visual_micro_batch_size},stream_query_mode=${stream_query_mode},use_custom_video_loader=${use_custom_video_loader},max_image_size=${max_image_size},attn_implementation=${attn_impl},use_fast_processor=${use_fast_processor},ssm_d_state=${ssm_d_state},ssm_max_memory_len=${ssm_max_memory_len},ssm_fusion_num_heads=${ssm_fusion_num_heads},ssm_fusion_bottleneck=${ssm_fusion_bottleneck},ssm_layer_sharing=${ssm_layer_sharing},ssm_fusion_policy=${ssm_fusion_policy}"
     if [ -n "$sliding_window_stride" ]; then
         model_args_default+=",sliding_window_stride=${sliding_window_stride}"
     fi
@@ -231,10 +233,10 @@ if importlib.util.find_spec("lmms_eval") is None:
 import transformers
 print(f"[vsr_qwen25] transformers_version={transformers.__version__}")
 
-is_vl = variant in {"vl", "qwen25vl"}
-is_sw_raw = variant in {"sw", "qwen25_sw"}
-is_sw_ssm = variant in {"sw_ssm", "qwen25_sw_ssm"}
-is_sw = is_sw_raw or is_sw_ssm
+is_vl = variant == "vl"
+is_sw_raw = variant == "sw"
+is_ssm = variant == "ssm"
+is_sw = is_sw_raw or is_ssm
 
 if is_vl or is_sw:
     if not hasattr(transformers, "Qwen2_5_VLForConditionalGeneration"):
@@ -242,7 +244,7 @@ if is_vl or is_sw:
         print("[vsr_qwen25] HINT: upgrade transformers in this env, then retry")
         sys.exit(2)
 
-if is_sw_ssm and importlib.util.find_spec("cambrian.ssm.ssm_compressor") is None:
+if is_ssm and importlib.util.find_spec("cambrian.ssm.ssm_compressor") is None:
     print("[vsr_qwen25] ERROR: cambrian.ssm.ssm_compressor is not importable in current PYTHONPATH")
     sys.exit(2)
 
@@ -254,7 +256,7 @@ check_environment
 
 cd "$REPO_ROOT"
 
-if { [ "$MODEL_VARIANT" = "vl" ] || [ "$MODEL_VARIANT" = "qwen25vl" ]; } && [ "$use_custom_video_loader" = "True" ] && [ "$video_fps" = "1" ] && [ "$max_num_frames" -le 0 ]; then
+if [ "$MODEL_VARIANT" = "vl" ] && [ "$use_custom_video_loader" = "True" ] && [ "$video_fps" = "1" ] && [ "$max_num_frames" -le 0 ]; then
     if [ "${chunk_seconds}" = "0" ] || [ "${chunk_seconds}" = "0.0" ]; then
         echo "[vsr_qwen25] ERROR: uncapped 1 FPS evaluation is not feasible for qwen2_5_vl without chunking."
         echo "[vsr_qwen25] REASON: without chunking, the full video goes into one Qwen2.5-VL forward pass and vision attention memory grows quadratically with sequence length."
@@ -299,7 +301,10 @@ run_eval() {
 
     # Common run metadata (all modes)
     echo "[vsr_qwen25] variant=$MODEL_VARIANT"
+    echo "[vsr_qwen25] launch_cwd=$LAUNCH_CWD"
     echo "[vsr_qwen25] repo_root=$REPO_ROOT"
+    echo "[vsr_qwen25] log_root=$LOG_ROOT"
+    echo "[vsr_qwen25] eval_output_root=$EVAL_OUTPUT_ROOT"
     echo "[vsr_qwen25] num_processes=$num_processes"
     echo "[vsr_qwen25] model_family=$model_family"
     echo "[vsr_qwen25] checkpoint=$checkpoint"
@@ -314,7 +319,7 @@ run_eval() {
     fi
 
     # Mode-specific run metadata
-    if [ "$MODEL_VARIANT" = "vl" ] || [ "$MODEL_VARIANT" = "qwen25vl" ]; then
+    if [ "$MODEL_VARIANT" = "vl" ]; then
         echo "[vsr_qwen25] mode=direct_video_start_end_windows"
         echo "[vsr_qwen25] use_custom_video_loader=$use_custom_video_loader"
         echo "[vsr_qwen25] min_pixels=$min_pixels"
@@ -333,8 +338,8 @@ run_eval() {
         fi
     else
         echo "[vsr_qwen25] mode=sliding_window"
-        if [ "$MODEL_VARIANT" = "sw" ] || [ "$MODEL_VARIANT" = "qwen25_sw" ]; then
-            echo "[vsr_qwen25] sliding_backend=raw_qwen25vl"
+        if [ "$MODEL_VARIANT" = "sw" ]; then
+            echo "[vsr_qwen25] sliding_backend=simplestream_raw_frame_window"
         else
             echo "[vsr_qwen25] sliding_backend=native_qwen25vl_ssm"
             echo "[vsr_qwen25] ssm_d_state=$ssm_d_state"
@@ -342,6 +347,7 @@ run_eval() {
             echo "[vsr_qwen25] ssm_fusion_num_heads=$ssm_fusion_num_heads"
             echo "[vsr_qwen25] ssm_fusion_bottleneck=$ssm_fusion_bottleneck"
             echo "[vsr_qwen25] ssm_layer_sharing=$ssm_layer_sharing"
+            echo "[vsr_qwen25] ssm_fusion_policy=$ssm_fusion_policy"
         fi
         echo "[vsr_qwen25] chunk_params_source=vsr_chunk_settings.sh"
         echo "[vsr_qwen25] num_frames=$num_frames"
