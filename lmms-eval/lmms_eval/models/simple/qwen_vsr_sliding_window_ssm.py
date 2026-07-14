@@ -9,7 +9,7 @@ from PIL import Image
 
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.qwen_ssm_patch import (
-    absorb_frame_to_ssm,
+    absorb_encoded_frame_to_ssm,
     build_qwen_ssm_compressor,
     install_qwen_ssm_fusion,
 )
@@ -22,9 +22,9 @@ class Qwen_VSR_SlidingWindow_SSM(Qwen_VSR_SlidingWindow):
     Native Qwen2.5-VL sliding-window path with CSMS SSM long-memory fusion.
 
     This class keeps the official Qwen2_5_VLForConditionalGeneration model and
-    patches its decoder layers after loading. Frames that leave the recent
-    window are absorbed into an SSM compressor and read back through a small
-    fusion module during the final answer.
+    patches its decoder layers after loading. Encoded frames that leave the
+    recent visual window are absorbed into an SSM compressor and read back
+    through a small fusion module during the final answer.
     """
 
     def __init__(
@@ -61,13 +61,12 @@ class Qwen_VSR_SlidingWindow_SSM(Qwen_VSR_SlidingWindow):
             f"ssm_layer_sharing={ssm_layer_sharing} fusion_policy={self.ssm_fusion_policy}"
         )
 
-    def _absorb_evicted_frame(self, context: str, frame: Image.Image):
-        absorb_frame_to_ssm(
+    def _absorb_evicted_encoded_frame(self, encoded_frame):
+        absorb_encoded_frame_to_ssm(
             getattr(self, "ssm_compressor", None),
             self.model,
-            self.processor,
-            frame,
-            self.device,
+            encoded_frame.vision_emb,
+            encoded_frame.grid_thw,
         )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -90,14 +89,14 @@ class Qwen_VSR_SlidingWindow_SSM(Qwen_VSR_SlidingWindow):
             return ""
 
         window_size = max(1, int(self.sensory_window_size))
-        recent_frames = deque()
+        encoded_window = deque()
         total_sampled = 0
         total_evicted = 0
         chunk_count = 0
         stream_start = time.perf_counter()
         previous_fusion = getattr(self.model, "ssm_fusion_enabled", False)
 
-        # Build SSM memory from frames that leave the same raw-frame window used by SW.
+        # Build SSM memory from encoded frames that leave the same visual window used by SW.
         # Fusion is disabled during ingestion so memory construction is not recursively conditioned on itself.
         self.model.ssm_fusion_enabled = False
         with torch.inference_mode():
@@ -137,12 +136,16 @@ class Qwen_VSR_SlidingWindow_SSM(Qwen_VSR_SlidingWindow):
                                 Image.Resampling.BICUBIC,
                             )
 
-                    if len(recent_frames) == window_size:
-                        evicted_frame = recent_frames.popleft()
-                        self._absorb_evicted_frame(context, evicted_frame)
+                    encoded_frame = self._encode_vision_frames([frame])
+                    encoded_frame.frame_index = int(frame_idx)
+                    encoded_frame.chunk_index = int(chunk_idx)
+
+                    if len(encoded_window) == window_size:
+                        evicted_frame = encoded_window.popleft()
+                        self._absorb_evicted_encoded_frame(evicted_frame)
                         total_evicted += 1
                         chunk_evicted += 1
-                    recent_frames.append(frame)
+                    encoded_window.append(encoded_frame)
 
                     total_sampled += 1
                     chunk_sampled += 1
@@ -152,17 +155,17 @@ class Qwen_VSR_SlidingWindow_SSM(Qwen_VSR_SlidingWindow):
                 if chunk_sampled > 0:
                     chunk_count += 1
                     eval_logger.info(
-                        f"[qwen_vsr_sw_ssm chunk] chunk_index={chunk_idx + 1}/{len(video_paths)} chunk_frames={chunk_sampled} kept_frames={len(recent_frames)} ssm_absorbed_frames={chunk_evicted} queries=0 query_mode=final input_fps={self.fps} window_mode=simplestream_csms_ssm"
+                        f"[qwen_vsr_sw_ssm chunk] chunk_index={chunk_idx + 1}/{len(video_paths)} chunk_frames={chunk_sampled} kept_frames={len(encoded_window)} ssm_absorbed_frames={chunk_evicted} queries=0 query_mode=final input_fps={self.fps} window_mode=simplestream_encoded_csms_ssm"
                     )
 
-        if not recent_frames:
+        if not encoded_window:
             self.model.ssm_fusion_enabled = previous_fusion
             return ""
 
         generate_start = time.perf_counter()
         self.model.ssm_fusion_enabled = True
         try:
-            answer = self._generate_with_recent_frames(context, list(recent_frames), current_gen_kwargs)
+            answer = self._generate_with_encoded_window(context, list(encoded_window), current_gen_kwargs)
         finally:
             self.model.ssm_fusion_enabled = previous_fusion
         generate_elapsed = time.perf_counter() - generate_start
@@ -173,7 +176,7 @@ class Qwen_VSR_SlidingWindow_SSM(Qwen_VSR_SlidingWindow):
 
         total_elapsed = time.perf_counter() - stream_start
         eval_logger.info(
-            f"[qwen_vsr_sw_ssm stream] chunks={chunk_count} sampled_frames={total_sampled} kept_frames={len(recent_frames)} ssm_absorbed_frames={total_evicted} queries=1 query_mode=final window_mode=simplestream_csms_ssm generate_s={generate_elapsed:.3f} total_s={total_elapsed:.3f}"
+            f"[qwen_vsr_sw_ssm stream] chunks={chunk_count} sampled_frames={total_sampled} kept_frames={len(encoded_window)} ssm_absorbed_frames={total_evicted} queries=1 query_mode=final window_mode=simplestream_encoded_csms_ssm generate_s={generate_elapsed:.3f} total_s={total_elapsed:.3f}"
         )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

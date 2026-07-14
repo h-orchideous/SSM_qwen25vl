@@ -1,7 +1,12 @@
+import os
+import sys
 import types
+import logging
 
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
 
 try:
     from cambrian.ssm.ssm_compressor import MemoryFusionLayer, SelectiveSSMLayer
@@ -11,6 +16,36 @@ except Exception as exc:  # pragma: no cover - exercised only when optional pack
     _SSM_IMPORT_ERROR = exc
 else:
     _SSM_IMPORT_ERROR = None
+
+_VMAMBA_CSM_IMPORT_ERROR = None
+_VMAMBA_CSM_LOGGED = False
+try:
+    from lmms_eval.models.model_utils.csm_triton import cross_merge_fn as _vmamba_cross_merge_fn
+    from lmms_eval.models.model_utils.csm_triton import cross_scan_fn as _vmamba_cross_scan_fn
+except Exception as exc:
+    try:
+        from cambrian.ssm.csm_triton import cross_merge_fn as _vmamba_cross_merge_fn
+        from cambrian.ssm.csm_triton import cross_scan_fn as _vmamba_cross_scan_fn
+    except Exception:
+        vmamba_models_path = os.environ.get(
+            "VMAMBA_MODELS_PATH",
+            "/home/ZhangHuayu/Workspace/VMamba/classification/models",
+        )
+        if vmamba_models_path and os.path.isdir(vmamba_models_path) and vmamba_models_path not in sys.path:
+            sys.path.append(vmamba_models_path)
+        try:
+            from csm_triton import cross_merge_fn as _vmamba_cross_merge_fn
+            from csm_triton import cross_scan_fn as _vmamba_cross_scan_fn
+        except Exception as retry_exc:  # pragma: no cover - depends on optional VMamba checkout
+            _vmamba_cross_scan_fn = None
+            _vmamba_cross_merge_fn = None
+            _VMAMBA_CSM_IMPORT_ERROR = retry_exc
+        else:
+            _VMAMBA_CSM_IMPORT_ERROR = None
+    else:
+        _VMAMBA_CSM_IMPORT_ERROR = None
+else:
+    _VMAMBA_CSM_IMPORT_ERROR = None
 
 
 def _get_text_config(model):
@@ -46,7 +81,36 @@ def _infer_2d_shape(num_tokens: int, preferred_shape=None):
 
 
 def _build_cross_scan_sequences(hidden_latents: torch.Tensor, map_h: int, map_w: int):
+    global _VMAMBA_CSM_LOGGED
+    if not _VMAMBA_CSM_LOGGED:
+        message = (
+            "[qwen_ssm_patch] "
+            f"vmamba_csm_available={_vmamba_cross_scan_fn is not None} "
+            f"hidden_latents_is_cuda={hidden_latents.is_cuda} "
+            f"import_error={_VMAMBA_CSM_IMPORT_ERROR}"
+        )
+        logger.info(message)
+        print(message, flush=True)
+        _VMAMBA_CSM_LOGGED = True
+
     hidden_map = hidden_latents.reshape(hidden_latents.size(0), int(map_h), int(map_w), hidden_latents.size(-1))
+    if _vmamba_cross_scan_fn is not None and hidden_latents.is_cuda:
+        # VMamba cross2d order is horizontal, vertical, horizontal_reverse, vertical_reverse.
+        # Keep the local compressor order as horizontal, horizontal_reverse, vertical, vertical_reverse.
+        scanned = _vmamba_cross_scan_fn(
+            hidden_map,
+            in_channel_first=False,
+            out_channel_first=False,
+            scans=0,
+            force_torch=False,
+        )
+        return (
+            scanned[:, :, 0, :].contiguous(),
+            scanned[:, :, 2, :].contiguous(),
+            scanned[:, :, 1, :].contiguous(),
+            scanned[:, :, 3, :].contiguous(),
+        )
+
     horizontal = hidden_map.reshape(hidden_latents.size(0), int(map_h) * int(map_w), hidden_latents.size(-1))
     vertical = hidden_map.transpose(1, 2).contiguous().reshape(
         hidden_latents.size(0),
@@ -62,6 +126,32 @@ def _build_cross_scan_sequences(hidden_latents: torch.Tensor, map_h: int, map_w:
 
 
 def _merge_cross_scan_outputs(directional_outputs, map_h: int, map_w: int):
+    if _vmamba_cross_merge_fn is not None and directional_outputs[0].is_cuda:
+        # Convert local order back to VMamba order: horizontal, vertical, horizontal_reverse, vertical_reverse.
+        merged_input = torch.stack(
+            [
+                directional_outputs[0],
+                directional_outputs[2],
+                directional_outputs[1],
+                directional_outputs[3],
+            ],
+            dim=2,
+        ).contiguous()
+        merged_input = merged_input.view(
+            directional_outputs[0].size(0),
+            int(map_h),
+            int(map_w),
+            4,
+            directional_outputs[0].size(-1),
+        )
+        return _vmamba_cross_merge_fn(
+            merged_input,
+            in_channel_first=False,
+            out_channel_first=False,
+            scans=0,
+            force_torch=False,
+        )
+
     horizontal = directional_outputs[0]
     horizontal_rev = torch.flip(directional_outputs[1], dims=[1])
     vertical = directional_outputs[2].reshape(
@@ -76,7 +166,7 @@ def _merge_cross_scan_outputs(directional_outputs, map_h: int, map_w: int):
         int(map_h),
         horizontal.size(-1),
     ).transpose(1, 2).contiguous().reshape_as(horizontal)
-    return (horizontal + horizontal_rev + vertical + vertical_rev) / 4.0
+    return horizontal + horizontal_rev + vertical + vertical_rev
 
 
 def _get_visual_merge_size(model) -> int:
@@ -88,14 +178,24 @@ def _get_visual_merge_size(model) -> int:
     return max(1, int(merge_size))
 
 
+def _spatial_shape_from_grid(model, grid_thw: torch.Tensor, num_tokens: int):
+    grid_t, grid_h, grid_w = [int(v) for v in grid_thw.reshape(-1, 3)[0].tolist()]
+    merge_size = _get_visual_merge_size(model)
+    preferred_h = max(1, grid_t * (grid_h // merge_size))
+    preferred_w = max(1, grid_w // merge_size)
+    return _infer_2d_shape(
+        int(num_tokens),
+        preferred_shape=(preferred_h, preferred_w),
+    )
+
+
 class SSMHiddenCompressor(nn.Module):
     """
     4-direction 2D hidden-latent SSM memory for SimpleStream-style evaluation.
 
-    Frames that leave the raw-frame window are encoded by Qwen2.5-VL's visual
-    encoder, restored as a 2D hidden-token map, and absorbed with V-Mamba-style
-    cross-scan directions. No rolling KV cache is maintained by the evaluation
-    model.
+    Encoded frames that leave the recent visual window are restored as a 2D
+    hidden-token map and absorbed with V-Mamba-style cross-scan directions.
+    No rolling KV cache is maintained by the evaluation model.
     """
 
     NUM_DIRECTIONS = 4
@@ -292,6 +392,21 @@ def install_qwen_ssm_fusion(model, compressor_attr: str = "ssm_compressor") -> i
 
 
 @torch.no_grad()
+def absorb_encoded_frame_to_ssm(compressor, model, vision_emb: torch.Tensor, grid_thw: torch.Tensor):
+    if compressor is None:
+        return
+
+    if vision_emb.ndim != 2:
+        raise ValueError(f"vision_emb must be (L, H), got {tuple(vision_emb.shape)}")
+    if grid_thw.ndim == 1:
+        grid_thw = grid_thw.unsqueeze(0)
+
+    map_h, map_w = _spatial_shape_from_grid(model, grid_thw, vision_emb.size(0))
+    visual_tokens = vision_emb[: map_h * map_w].unsqueeze(0)
+    compressor.absorb_spatial_hidden(visual_tokens, spatial_shape=(map_h, map_w))
+
+
+@torch.no_grad()
 def absorb_frame_to_ssm(compressor, model, processor, frame, device):
     if compressor is None:
         return
@@ -300,13 +415,4 @@ def absorb_frame_to_ssm(compressor, model, processor, frame, device):
     pixel_values = frame_batch["pixel_values"].to(device, dtype=model.visual.dtype)
     image_grid_thw = frame_batch["image_grid_thw"].to(device)
     image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
-    grid_t, grid_h, grid_w = [int(v) for v in image_grid_thw[0].tolist()]
-    merge_size = _get_visual_merge_size(model)
-    preferred_h = max(1, grid_t * (grid_h // merge_size))
-    preferred_w = max(1, grid_w // merge_size)
-    map_h, map_w = _infer_2d_shape(
-        image_embeds.size(0),
-        preferred_shape=(preferred_h, preferred_w),
-    )
-    visual_tokens = image_embeds[: map_h * map_w].unsqueeze(0)
-    compressor.absorb_spatial_hidden(visual_tokens, spatial_shape=(map_h, map_w))
+    absorb_encoded_frame_to_ssm(compressor, model, image_embeds, image_grid_thw)
