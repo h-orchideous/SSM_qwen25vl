@@ -8,7 +8,7 @@
 | ----------------- | ------------------------------- | --------------------------------------------- | --------------------------------------------------- |
 | `vl`            | `qwen2_5_vl`                  | 原生 Qwen2.5-VL 视频推理，配合 chunk/fps 控制 | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
 | `sw`            | `qwen_vsr_sliding_window`     | SimpleStream：流式读帧，只保留最近 N 帧 raw frames，最后 query 一次 | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
-| `ssm`           | `qwen_vsr_sliding_window_ssm` | KV-CSMS 流式机制：每帧先经过 Qwen2.5-VL prefill 产生 decoder KV，窗口外 visual KV 按帧内 H×W 重排后写入 4-direction SSM hidden state，最后用当前 KV 窗口 + SSM fusion query | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
+| `ssm`           | `qwen_vsr_sliding_window_ssm` | Temporal KV-SSM 流式机制：每帧先经过 Qwen2.5-VL prefill 产生 decoder KV，窗口外 KV 按视频时间顺序写入每层 SSM hidden state，最后用当前 KV 窗口 + SSM fusion query | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
 
 ## 入口脚本
 
@@ -199,9 +199,9 @@ STREAM_QUERY_MODE=chunk
 
 ### `MODEL_VARIANT=ssm`
 
-该模式使用 `qwen_vsr_sliding_window_ssm`。它实现的是 KV-CSMS：视频按 chunk 流式读取，每个采样帧都会先经过 Qwen2.5-VL prefill，产生该帧对应的 decoder `past_key_values`；当前 cache 只保留最近 `SENSORY_WINDOW_SIZE` 帧对应的 KV。窗口外 visual KV 在被裁掉前按该帧视觉 token 的 H×W 网格重排，并沿 4 个方向写入 SSM hidden state。所有 chunk 读完后只 query 一次，最终回答使用当前 KV 窗口，并在每层 decoder 中通过 SSM fusion 从每层 4-direction hidden state 投影出的少量 memory tokens 读取窗口外压缩历史。
+该模式使用 `qwen_vsr_sliding_window_ssm`。它实现的是 Temporal KV-SSM：视频按 chunk 流式读取，每个采样帧都会先经过 Qwen2.5-VL prefill，产生该帧对应的 decoder `past_key_values`；当前 cache 只保留最近 `SENSORY_WINDOW_SIZE` 帧对应的 KV。窗口外 KV 在被裁掉前按视频时间顺序写入每层 SSM hidden state。所有 chunk 读完后只 query 一次，最终回答使用当前 KV 窗口，并在每层 decoder 中通过 SSM fusion 从每层 recurrent hidden state 投影出的 memory token 读取窗口外压缩历史。
 
-注意：这里的 SSM 压缩对象是 decoder attention KV，不是视觉 hidden tokens。当前实现不再维护 `SSM_MAX_MEMORY_LEN` 个历史 memory buffer；历史信息保存在每层 4 个方向的 recurrent hidden state 中。`SSM_MAX_MEMORY_LEN` 参数保留为脚本兼容项，但在当前 KV-CSMS 路径中不参与计算。
+注意：这里的 SSM 压缩对象是 decoder attention KV，不是原始帧或视觉 hidden tokens。当前实现不再维护 `SSM_MAX_MEMORY_LEN` 个历史 memory buffer；历史信息保存在每层一个 temporal recurrent hidden state 中。`SSM_MAX_MEMORY_LEN` 参数保留为脚本兼容项，但在当前 state-only 路径中不参与计算。
 
 常用覆盖参数：
 
@@ -215,7 +215,7 @@ SENSORY_WINDOW_MAX_TOKENS=0
 STREAM_VISUAL_MICRO_BATCH_SIZE=1
 STREAM_QUERY_MODE=chunk
 SSM_D_STATE=64
-# SSM_MAX_MEMORY_LEN is kept for CLI compatibility but ignored by current KV-CSMS.
+# SSM_MAX_MEMORY_LEN is kept for CLI compatibility but ignored by current state-only temporal KV-SSM.
 SSM_MAX_MEMORY_LEN=256
 SSM_FUSION_NUM_HEADS=8
 SSM_FUSION_BOTTLENECK=256
@@ -279,7 +279,7 @@ bash scripts/vsr_qwen25vl.sh
 - `8 卡峰值总和(GiB)`：8 张 GPU 峰值显存相加，用于粗略比较总显存占用。
 - `平均 GPU 利用率(%)`：`gpu.csv` 中 `utilization.gpu` 的平均值，用于观察运行期间 GPU 计算饱和度。
 
-从当前记录看，`sw` 在本轮 SimpleStream 逻辑下比 `vl` 更快；旧表中的 `ssm` 结果来自上一版机制，当前 KV-CSMS 改动后需要重新评测。当前 `ssm` 的 fusion 参数未经过任务训练，本节只做效率链路记录。
+从当前记录看，`sw` 在本轮 SimpleStream 逻辑下比 `vl` 更快；旧表中的 `ssm` 结果来自上一版机制，当前 temporal KV-SSM 改动后需要重新评测。当前 `ssm` 的 fusion 参数未经过任务训练，本节只做效率链路记录。
 
 ## 对比三种机制的推荐模板
 

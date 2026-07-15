@@ -16,6 +16,11 @@ except ImportError:
     selective_scan_fn = None
     print("SSM Compressor: CUDA kernel not found, will use PyTorch fallback")
 
+try:
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+except Exception:
+    selective_state_update = None
+
 
 class SelectiveSSMLayer(nn.Module):
     """
@@ -23,7 +28,7 @@ class SelectiveSSMLayer(nn.Module):
     使用 selective_scan_cuda_oflex CUDA kernel。
     
     功能：接收被 evict 的 KV pairs，增量更新隐状态 h，
-    同时输出 "processed KV" 累积到 memory buffer 中。
+    同时返回更新后的 recurrent state。
     
     思路：
     - 输入是 concat(K, V)，因为 K 和 V 的压缩应该是联合的
@@ -125,6 +130,15 @@ class SelectiveSSMLayer(nn.Module):
             D:     (d_inner,)
             z:     None (oflex 不支持)
         """
+        if ssm_state is not None:
+            if (
+                selective_state_update is not None
+                and kv_input.is_cuda
+                and not torch.is_grad_enabled()
+            ):
+                return self._forward_state_update_cuda(kv_input, ssm_state)
+            return self._forward_pytorch(kv_input, ssm_state)
+
         batch, seq_len, _ = kv_input.shape
         residual = kv_input
         input_dtype = kv_input.dtype
@@ -184,6 +198,114 @@ class SelectiveSSMLayer(nn.Module):
         last_state = last_state.to(input_dtype)
         
         return output, last_state
+
+    def _forward_state_update_cuda(
+        self,
+        kv_input: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Stateful inference path using Mamba's Triton selective_state_update.
+
+        selective_scan_cuda/oflex can scan a sequence fast but cannot accept an
+        initial state. This path updates the carried state token by token on GPU,
+        preserving temporal history across absorbed segments.
+        """
+        batch, seq_len, _ = kv_input.shape
+        residual = kv_input
+        input_dtype = kv_input.dtype
+
+        kv_input = self.norm(kv_input)
+        xz = self.in_proj(kv_input)
+        x, z = xz.chunk(2, dim=-1)
+
+        x = x.transpose(1, 2).contiguous()
+        x = self.conv1d(x)[:, :, :seq_len]
+        x = F.silu(x).transpose(1, 2).contiguous()
+
+        A = -torch.exp(self.A_log.float())
+        D = self.D.float()
+        state = ssm_state.contiguous()
+        outputs = []
+
+        for t in range(seq_len):
+            x_t = x[:, t].contiguous()
+            dt_t = self.dt_proj(x_t[:, : self.dt_rank]).contiguous()
+            B_t = self.B_proj(x_t).contiguous()
+            C_t = self.C_proj(x_t).contiguous()
+            z_t = z[:, t].contiguous()
+            y_t = selective_state_update(
+                state,
+                x_t,
+                dt_t,
+                A,
+                B_t,
+                C_t,
+                D=D,
+                z=z_t,
+                dt_softplus=True,
+            )
+            outputs.append(y_t)
+
+        y = torch.stack(outputs, dim=1)
+        output = self.out_proj(y) + residual
+        return output, state.to(input_dtype)
+
+    def update_state_only(
+        self,
+        kv_input: torch.Tensor,
+        ssm_state: Optional[torch.Tensor] = None,
+        chunk_size: int = 64,
+    ) -> torch.Tensor:
+        """
+        Update recurrent state without materializing SSM outputs.
+
+        The compressor only reads the final hidden state for fusion, so this
+        computes the recurrence in vectorized chunks instead of running a
+        Python loop over every evicted token.
+        """
+        batch, seq_len, _ = kv_input.shape
+        input_dtype = kv_input.dtype
+
+        kv_input = self.norm(kv_input)
+        xz = self.in_proj(kv_input)
+        x, _ = xz.chunk(2, dim=-1)
+        x = x.transpose(1, 2).contiguous()
+        x = self.conv1d(x)[:, :, :seq_len]
+        x = F.silu(x).transpose(1, 2).contiguous()
+
+        if ssm_state is None:
+            state = torch.zeros(
+                batch,
+                self.d_inner,
+                self.d_state,
+                device=kv_input.device,
+                dtype=torch.float32,
+            )
+        else:
+            state = ssm_state.float()
+
+        A = -torch.exp(self.A_log.float())
+        chunk_size = max(1, int(chunk_size))
+        for start in range(0, seq_len, chunk_size):
+            x_chunk = x[:, start : start + chunk_size]
+            dt_input = x_chunk[..., : self.dt_rank].to(self.dt_proj.weight.dtype)
+            b_input = x_chunk.to(self.B_proj.weight.dtype)
+            dt = F.softplus(self.dt_proj(dt_input).float())
+            B = self.B_proj(b_input).float()
+            x_chunk = x_chunk.float()
+
+            delta_a = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
+            delta_b = dt.unsqueeze(-1) * B.unsqueeze(2) * x_chunk.unsqueeze(-1)
+
+            prod_all = delta_a.prod(dim=1)
+            suffix_prod = torch.cumprod(torch.flip(delta_a, dims=[1]), dim=1)
+            suffix_prod = torch.flip(suffix_prod, dims=[1])
+            ones = torch.ones_like(suffix_prod[:, :1])
+            suffix_after = torch.cat([suffix_prod[:, 1:], ones], dim=1)
+            state = prod_all * state + (delta_b * suffix_after).sum(dim=1)
+
+        return state.to(input_dtype)
     
     def _forward_pytorch(
         self,
@@ -320,20 +442,21 @@ class MemoryFusionLayer(nn.Module):
 
 class SSMCacheCompressor(nn.Module):
     """
-    完整的 SSM 长期记忆系统。
+    State-only temporal SSM 长期记忆系统。
     
     架构总结:
     ┌──────────────────────────────────────────────────────────────┐
     │ Per Transformer Layer:                                        │
     │                                                                │
-    │   evicted KV ──→ SelectiveSSMLayer ──→ ssm_state (persistent) │
-    │                         │                                      │
-    │                         └──→ ssm_memory buffer (累积)          │
-    │                                    │                           │
-    │   hidden_states ──→ MemoryFusionLayer ←──┘                    │
+    │   evicted frame KV ──→ SelectiveSSMLayer ──→ h_t              │
+    │                                              │                │
+    │   hidden_states ──→ MemoryFusionLayer ←──────┘                │
     │                         │                                      │
     │                         └──→ memory_context (加到 attn 输出)   │
     └──────────────────────────────────────────────────────────────┘
+
+    这个版本按视频时间顺序递推，只保留每层一个 recurrent hidden state。
+    不再保存 max_memory_len 个历史 memory tokens，因此历史存储不随视频长度增长。
     """
     
     def __init__(
@@ -354,6 +477,8 @@ class SSMCacheCompressor(nn.Module):
         self.head_dim = head_dim
         self.hidden_dim = hidden_dim
         self.d_kv = num_kv_heads * head_dim
+        # Kept for CLI/checkpoint compatibility. State-only temporal SSM does
+        # not keep a rolling memory-token buffer.
         self.max_memory_len = max_memory_len
         
         # Layer sharing
@@ -394,7 +519,6 @@ class SSMCacheCompressor(nn.Module):
         
         # Runtime states（非参数，不保存到 checkpoint）
         self._ssm_states: List[Optional[torch.Tensor]] = [None] * num_layers
-        self._ssm_memories: List[Optional[torch.Tensor]] = [None] * num_layers
         # 缓存投影后的 memory（避免重复计算）
         self._projected_memories: List[Optional[torch.Tensor]] = [None] * num_layers
         self._dirty: List[bool] = [True] * num_layers
@@ -413,8 +537,8 @@ class SSMCacheCompressor(nn.Module):
         
         处理流程:
         1. reshape KV: (B,H,L,D) → (B,L,H*D) → concat → (B,L,2*H*D)
-        2. SSM forward: 顺序扫描 evicted tokens，更新 ssm_state
-        3. 累积 SSM 输出到 memory buffer（用于后续 cross-attention readout）
+        2. SSM forward: 按时间顺序扫描 evicted tokens，更新 ssm_state
+        3. fusion 时只从当前 ssm_state 投影出一个 memory token
         """
         batch, _, evict_len, _ = evicted_keys.shape
         
@@ -425,29 +549,40 @@ class SSMCacheCompressor(nn.Module):
         
         ssm_idx = self._layer_map[layer_idx]
         
-        # SSM forward
-        ssm_output, new_state = self.ssm_layers[ssm_idx](
+        new_state = self.ssm_layers[ssm_idx].update_state_only(
             kv_input,
             self._ssm_states[layer_idx],
         )
         
         # 更新隐状态（detach 断开计算图，避免内存泄漏）
         self._ssm_states[layer_idx] = new_state.detach()
-        
-        # 累积 SSM 输出到 memory buffer
-        if self._ssm_memories[layer_idx] is None:
-            self._ssm_memories[layer_idx] = ssm_output.detach()
-        else:
-            self._ssm_memories[layer_idx] = torch.cat(
-                [self._ssm_memories[layer_idx], ssm_output.detach()],
-                dim=1,
-            )
-            # 限制 memory buffer 大小
-            if self._ssm_memories[layer_idx].shape[1] > self.max_memory_len:
-                self._ssm_memories[layer_idx] = \
-                    self._ssm_memories[layer_idx][:, -self.max_memory_len:]
-        
+
         # 标记缓存失效
+        self._dirty[layer_idx] = True
+        self._projected_memories[layer_idx] = None
+
+    def absorb_trainable(
+        self,
+        layer_idx: int,
+        evicted_keys: torch.Tensor,
+        evicted_values: torch.Tensor,
+    ):
+        """
+        Training-time state update. Unlike absorb(), this keeps the computation
+        graph so SelectiveSSMLayer, memory projection, and fusion parameters can
+        be optimized from the language-model loss.
+        """
+        batch, _, evict_len, _ = evicted_keys.shape
+        k_flat = evicted_keys.transpose(1, 2).reshape(batch, evict_len, -1)
+        v_flat = evicted_values.transpose(1, 2).reshape(batch, evict_len, -1)
+        kv_input = torch.cat([k_flat, v_flat], dim=-1)
+
+        ssm_idx = self._layer_map[layer_idx]
+        new_state = self.ssm_layers[ssm_idx].update_state_only(
+            kv_input,
+            self._ssm_states[layer_idx],
+        )
+        self._ssm_states[layer_idx] = new_state
         self._dirty[layer_idx] = True
         self._projected_memories[layer_idx] = None
     
@@ -461,7 +596,7 @@ class SSMCacheCompressor(nn.Module):
         Returns:
             memory: (B, mem_len, hidden_dim) or None
         """
-        if self._ssm_memories[layer_idx] is None:
+        if self._ssm_states[layer_idx] is None:
             return None
         
         # 使用缓存避免重复投影
@@ -469,8 +604,14 @@ class SSMCacheCompressor(nn.Module):
             return self._projected_memories[layer_idx]
         
         ssm_idx = self._layer_map[layer_idx]
-        raw_memory = self._ssm_memories[layer_idx]          # (B, mem_len, 2*d_kv)
+        # SelectiveSSMLayer state shape: (B, d_inner, d_state).
+        # d_inner == 2*d_kv with the current default expand=2, so mean over
+        # d_state gives one temporal memory token in the KV feature space.
+        raw_memory = self._ssm_states[layer_idx].mean(dim=-1).unsqueeze(1)
         projected = self.memory_up_projs[ssm_idx](raw_memory)  # (B, mem_len, hidden_dim)
+
+        if projected.requires_grad:
+            return projected
         
         self._projected_memories[layer_idx] = projected.detach()
         self._dirty[layer_idx] = False
@@ -504,12 +645,11 @@ class SSMCacheCompressor(nn.Module):
     
     def has_memory(self, layer_idx: int) -> bool:
         """检查指定层是否有 SSM memory。"""
-        return self._ssm_memories[layer_idx] is not None
+        return self._ssm_states[layer_idx] is not None
     
     def reset(self):
         """新视频时重置所有状态。"""
         self._ssm_states = [None] * self.num_layers
-        self._ssm_memories = [None] * self.num_layers
         self._projected_memories = [None] * self.num_layers
         self._dirty = [True] * self.num_layers
     
@@ -520,9 +660,9 @@ class SSMCacheCompressor(nn.Module):
         """返回当前 memory 使用情况。"""
         stats = {}
         for i in range(self.num_layers):
-            if self._ssm_memories[i] is not None:
+            if self._ssm_states[i] is not None:
                 stats[f"layer_{i}"] = {
-                    "memory_len": self._ssm_memories[i].shape[1],
+                    "memory_len": 1,
                     "ssm_state_norm": self._ssm_states[i].norm().item() if self._ssm_states[i] is not None else 0,
                 }
         return stats

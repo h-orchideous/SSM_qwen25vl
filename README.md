@@ -8,7 +8,7 @@ This repository is trimmed to the files needed for Qwen2.5-VL VSR evaluation wit
 | ---- | --------------- | --------- |
 | `vl` | `qwen2_5_vl` | Native Qwen2.5-VL video inference. Long videos are split into chunks before inference. |
 | `sw` | `qwen_vsr_sliding_window` | SimpleStream-style frame streaming. The model keeps only the latest `SENSORY_WINDOW_SIZE` raw frames and queries once at the end. No KV cache is retained. |
-| `ssm` | `qwen_vsr_sliding_window_ssm` | KV-CSMS streaming. Each frame is prefetched through Qwen2.5-VL to produce decoder KV; visual KV outside the recent frame window is reshaped to its frame H x W grid and absorbed by 4-direction SSM hidden states. Final query uses the current KV window and SSM fusion. |
+| `ssm` | `qwen_vsr_sliding_window_ssm` | Temporal KV-SSM streaming. Each frame is prefetched through Qwen2.5-VL to produce decoder KV; KV outside the recent frame window is absorbed in time order into per-layer SSM hidden states. Final query uses the current KV window and SSM fusion. |
 
 ## Kept Runtime Scope
 
@@ -16,9 +16,7 @@ This repository is trimmed to the files needed for Qwen2.5-VL VSR evaluation wit
 - `lmms-eval/scripts/vsr_chunk_settings.sh`: shared chunk defaults sourced by the launcher.
 - `lmms-eval/scripts/prepare_vsr_chunks.py`: optional pre-chunk helper.
 - `lmms-eval/lmms_eval/models/simple/qwen_vsr_sliding_window.py`: clean SimpleStream sliding-window baseline.
-- `lmms-eval/lmms_eval/models/simple/qwen_vsr_sliding_window_ssm.py`: KV-CSMS SSM evaluation path.
-- `lmms-eval/lmms_eval/models/model_utils/qwen_ssm_patch.py`: SSM fusion patch and 4-direction hidden-latent compressor.
-- `lmms-eval/lmms_eval/models/model_utils/csm_triton.py`: VMamba CrossScan/CrossMerge Triton operators used by CSMS.
+- `lmms-eval/lmms_eval/models/simple/qwen_vsr_sliding_window_ssm.py`: temporal KV-SSM evaluation path.
 - `lmms-eval/lmms_eval/models/model_utils/qwen_chunk_utils.py`: robust video chunk materialization.
 - `lmms-eval/lmms_eval/tasks/cambrians_vsr_local/vsr_local_10mins.yaml`: default local VSR task.
 - `cambrian/ssm/`: selective SSM and CUDA selective-scan integration used by `ssm`.

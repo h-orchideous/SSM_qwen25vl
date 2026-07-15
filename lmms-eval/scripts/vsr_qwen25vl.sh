@@ -210,8 +210,8 @@ elif [ "$MODEL_VARIANT" = "sw" ]; then
         model_args_default+=",sliding_window_stride=${sliding_window_stride}"
     fi
 else
-    # ssm: KV-CSMS. Stream frames through decoder KV, absorb evicted visual KV
-    # into 4-direction SSM hidden states, and fuse at final query.
+    # ssm: temporal KV-SSM. Stream frames through decoder KV, absorb evicted KV
+    # into per-layer recurrent hidden states, and fuse at final query.
     model_args_default="pretrained=${checkpoint},min_pixels=${min_pixels},max_pixels=${max_pixels},video_max_frames=${num_frames},video_fps=${video_fps},miv_token_len=${miv_token_len},si_token_len=${si_token_len},sensory_window_size=${sensory_window_size},sensory_window_max_tokens=${sensory_window_max_tokens},stream_visual_micro_batch_size=${stream_visual_micro_batch_size},stream_query_mode=${stream_query_mode},use_custom_video_loader=${use_custom_video_loader},max_image_size=${max_image_size},attn_implementation=${attn_impl},use_fast_processor=${use_fast_processor},ssm_d_state=${ssm_d_state},ssm_max_memory_len=${ssm_max_memory_len},ssm_fusion_num_heads=${ssm_fusion_num_heads},ssm_fusion_bottleneck=${ssm_fusion_bottleneck},ssm_layer_sharing=${ssm_layer_sharing},ssm_fusion_policy=${ssm_fusion_policy}"
     if [ -n "$sliding_window_stride" ]; then
         model_args_default+=",sliding_window_stride=${sliding_window_stride}"
@@ -344,7 +344,7 @@ run_eval() {
         else
             echo "[vsr_qwen25] sliding_backend=native_qwen25vl_ssm"
             echo "[vsr_qwen25] ssm_d_state=$ssm_d_state"
-            echo "[vsr_qwen25] ssm_max_memory_len=$ssm_max_memory_len (ignored by current KV-CSMS state-only compressor)"
+            echo "[vsr_qwen25] ssm_max_memory_len=$ssm_max_memory_len (ignored by current temporal state-only compressor)"
             echo "[vsr_qwen25] ssm_fusion_num_heads=$ssm_fusion_num_heads"
             echo "[vsr_qwen25] ssm_fusion_bottleneck=$ssm_fusion_bottleneck"
             echo "[vsr_qwen25] ssm_layer_sharing=$ssm_layer_sharing"
