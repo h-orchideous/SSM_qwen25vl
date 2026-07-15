@@ -7,8 +7,8 @@
 | `MODEL_VARIANT` | lmms-eval 模型名                | 机制                                          | 默认 checkpoint                                     |
 | ----------------- | ------------------------------- | --------------------------------------------- | --------------------------------------------------- |
 | `vl`            | `qwen2_5_vl`                  | 原生 Qwen2.5-VL 视频推理，配合 chunk/fps 控制 | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
-| `sw`            | `qwen_vsr_sliding_window`     | SimpleStream：流式读帧并立即编码，只保留最近 N 帧 encoded visual frames，最后 query 一次 | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
-| `ssm`           | `qwen_vsr_sliding_window_ssm` | 在 SimpleStream encoded 滑窗基础上，出窗 encoded frame 写入 V-Mamba 风格 4-direction CSMS SSM，最后用当前窗口 + SSM fusion query | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
+| `sw`            | `qwen_vsr_sliding_window`     | SimpleStream：流式读帧，只保留最近 N 帧 raw frames，最后 query 一次 | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
+| `ssm`           | `qwen_vsr_sliding_window_ssm` | KV-CSMS 流式机制：每帧先经过 Qwen2.5-VL prefill 产生 decoder KV，窗口外 visual KV 按帧内 H×W 重排后写入 4-direction SSM hidden state，最后用当前 KV 窗口 + SSM fusion query | `/data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct` |
 
 ## 入口脚本
 
@@ -180,7 +180,7 @@ USE_FAST_PROCESSOR=True
 
 ### `MODEL_VARIANT=sw`
 
-该模式使用 `qwen_vsr_sliding_window`，对应 SimpleStream recent-window baseline：视频按 chunk 流式读取，每个采样帧会立即经过 Qwen2.5-VL visual encoder 编码，内部只维护最近 `SENSORY_WINDOW_SIZE` 个 encoded visual frame；窗口满后新帧进入、最旧 encoded frame 直接丢弃。所有 chunk 读完后，只用最后窗口里的 encoded visual frames 构造输入并 query 一次。
+该模式使用 `qwen_vsr_sliding_window`，对应 SimpleStream recent-window baseline：视频按 chunk 流式读取，内部只维护最近 `SENSORY_WINDOW_SIZE` 帧 raw frames；窗口满后新帧进入、最旧帧直接丢弃。所有 chunk 读完后，只把最后窗口里的 N 帧作为普通 Qwen2.5-VL video 输入并 query 一次。
 
 常用覆盖参数：
 
@@ -199,7 +199,9 @@ STREAM_QUERY_MODE=chunk
 
 ### `MODEL_VARIANT=ssm`
 
-该模式使用 `qwen_vsr_sliding_window_ssm`。它是在 `sw` 的 SimpleStream encoded 滑窗基础上增加 V-Mamba 风格 CSMS SSM：视频按 chunk 流式读取，每个采样帧先编码为 visual hidden tokens，当前窗口只保留最近 `SENSORY_WINDOW_SIZE` 个 encoded visual frame；当新帧进入导致旧 encoded frame 出窗时，该旧帧对应的 2D hidden token map 会沿横向顺序、横向反向、纵向顺序、纵向反向 4 个方向独立扫描写入 SSM 隐变量压缩空间。所有 chunk 读完后只 query 一次，最终回答输入为当前 encoded 窗口，同时通过 SSM fusion 读取窗口外压缩历史。
+该模式使用 `qwen_vsr_sliding_window_ssm`。它实现的是 KV-CSMS：视频按 chunk 流式读取，每个采样帧都会先经过 Qwen2.5-VL prefill，产生该帧对应的 decoder `past_key_values`；当前 cache 只保留最近 `SENSORY_WINDOW_SIZE` 帧对应的 KV。窗口外 visual KV 在被裁掉前按该帧视觉 token 的 H×W 网格重排，并沿 4 个方向写入 SSM hidden state。所有 chunk 读完后只 query 一次，最终回答使用当前 KV 窗口，并在每层 decoder 中通过 SSM fusion 从每层 4-direction hidden state 投影出的少量 memory tokens 读取窗口外压缩历史。
+
+注意：这里的 SSM 压缩对象是 decoder attention KV，不是视觉 hidden tokens。当前实现不再维护 `SSM_MAX_MEMORY_LEN` 个历史 memory buffer；历史信息保存在每层 4 个方向的 recurrent hidden state 中。`SSM_MAX_MEMORY_LEN` 参数保留为脚本兼容项，但在当前 KV-CSMS 路径中不参与计算。
 
 常用覆盖参数：
 
@@ -213,13 +215,14 @@ SENSORY_WINDOW_MAX_TOKENS=0
 STREAM_VISUAL_MICRO_BATCH_SIZE=1
 STREAM_QUERY_MODE=chunk
 SSM_D_STATE=64
+# SSM_MAX_MEMORY_LEN is kept for CLI compatibility but ignored by current KV-CSMS.
 SSM_MAX_MEMORY_LEN=256
 SSM_FUSION_NUM_HEADS=8
 SSM_FUSION_BOTTLENECK=256
 SSM_LAYER_SHARING=group4
 ```
 
-注意：当前 SSM fusion 新增的参数是随机初始化的机制参数；如果要追求准确率，需要针对该机制继续训练或微调。未训练时更适合先用于链路验证和效率实验。
+注意：当前 SSM fusion 新增的参数是随机初始化的机制参数；如果要追求任务效果，需要针对该机制继续训练或微调。未训练时更适合先用于链路验证和效率实验。
 
 ## 单视频调试
 
@@ -254,30 +257,29 @@ bash scripts/vsr_qwen25vl.sh
 | `gpu.csv`     | 定时采样的 GPU 利用率、显存和功耗。                                              |
 | `metrics.csv` | 每个`LOG_ROOT` 下累积保存的耗时和吞吐汇总。                                    |
 
-VSR 任务的指标是 exact match accuracy。评测代码会从模型输出中取第一个 token-like 答案，与标准答案字母做匹配，最终聚合结果记录为 `Overall`。
+效率记录只关注运行性能，不记录任务准确率。
 
 ## 当前效率记录
 
 以下结果整理自 `/home/ZhangHuayu/Workspace/cambrian-s/lmms-eval/scripts/logs/vsr_eval_runs`。本表只记录 `samples=60` 且 `exit_status=0` 的完整运行；`samples=0` 的失败或中断记录不纳入对比。
 
-| 模式 | run_id | Overall(%) | 总耗时(s) | 平均耗时(s/sample) | 吞吐(samples/s) | 单卡峰值显存(GiB) | 各卡峰值均值(GiB) | 8 卡峰值总和(GiB) | 平均 GPU 利用率(%) |
-| ---- | ------ | ---------- | --------- | ------------------ | --------------- | ----------------- | ----------------- | ----------------- | ------------------ |
-| `vl` | `20260714_144732` | 26.667 | 2061 | 34.350 | 0.029112 | 41.868 | 30.800 | 246.403 | 60.01 |
-| `sw` | `20260714_172805` | 21.667 | 1118 | 18.633 | 0.053667 | 43.778 | 26.217 | 209.736 | 49.61 |
-| `ssm` | `20260714_185813` | 18.333 | 1775 | 29.583 | 0.033803 | 39.513 | 28.223 | 225.785 | 33.75 |
+| 模式 | run_id | 样本数 | 总耗时(s) | 平均耗时(s/sample) | 吞吐(samples/s) | 单卡峰值显存(GiB) | 各卡峰值均值(GiB) | 8 卡峰值总和(GiB) | 平均 GPU 利用率(%) |
+| ---- | ------ | ------ | --------- | ------------------ | --------------- | ----------------- | ----------------- | ----------------- | ------------------ |
+| `vl` | `20260714_144732` | 60 | 2061 | 34.350 | 0.029112 | 41.868 | 30.800 | 246.403 | 60.01 |
+| `sw` | `20260714_172805` | 60 | 1118 | 18.633 | 0.053667 | 43.778 | 26.217 | 209.736 | 49.61 |
+| `ssm` | `20260714_185813` | 60 | 1775 | 29.583 | 0.033803 | 39.513 | 28.223 | 225.785 | 33.75 |
 
 指标含义：
 
 - `总耗时(s)`：本次完整评测的 wall-clock 时间，来自 `summary.txt` 的 `seconds`。
 - `平均耗时(s/sample)`：`seconds / samples`，越小表示单样本处理越快。
 - `吞吐(samples/s)`：`samples / seconds`，越大表示整体吞吐越高。
-- `Overall(%)`：lmms-eval 记录的 VSR exact-match score。
 - `单卡峰值显存(GiB)`：所有 GPU 中观测到的最大单卡 `memory.used` 峰值，用于判断是否接近 OOM。
 - `各卡峰值均值(GiB)`：每张 GPU 各自显存峰值的平均，用于比较典型单卡压力。
 - `8 卡峰值总和(GiB)`：8 张 GPU 峰值显存相加，用于粗略比较总显存占用。
 - `平均 GPU 利用率(%)`：`gpu.csv` 中 `utilization.gpu` 的平均值，用于观察运行期间 GPU 计算饱和度。
 
-从当前记录看，`sw` 在本轮 SimpleStream encoded-window 逻辑下比 `vl` 更快；`ssm` 在保留窗口外 CSMS 历史的同时，耗时介于 `vl` 与 `sw` 之间。`vl` 仍是原生 Qwen2.5-VL chunk 视频输入，单个 chunk 的视觉序列更长，因此总耗时最高。当前 `ssm` 的 fusion 参数未经过任务训练，准确率数字主要用于链路记录，效率对比更有参考价值。
+从当前记录看，`sw` 在本轮 SimpleStream 逻辑下比 `vl` 更快；旧表中的 `ssm` 结果来自上一版机制，当前 KV-CSMS 改动后需要重新评测。当前 `ssm` 的 fusion 参数未经过任务训练，本节只做效率链路记录。
 
 ## 对比三种机制的推荐模板
 
@@ -304,7 +306,7 @@ MODEL_VARIANT=ssm bash scripts/vsr_qwen25vl.sh
 
 - `summary.txt`：耗时、吞吐、样本数和退出状态。
 - `metrics.csv`：多次运行的性能汇总。
-- 各 `output_*` 目录：lmms-eval 的预测样本与准确率结果。
+- 各 `output_*` 目录：lmms-eval 的预测样本与原始输出。
 - `gpu.csv`：GPU 利用率、显存峰值和功耗。
 
 ## 常见问题

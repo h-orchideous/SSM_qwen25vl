@@ -7,8 +7,8 @@ This repository is trimmed to the files needed for Qwen2.5-VL VSR evaluation wit
 | Mode | lmms-eval model | Mechanism |
 | ---- | --------------- | --------- |
 | `vl` | `qwen2_5_vl` | Native Qwen2.5-VL video inference. Long videos are split into chunks before inference. |
-| `sw` | `qwen_vsr_sliding_window` | SimpleStream-style frame streaming. Each sampled frame is encoded immediately, the model keeps only the latest `SENSORY_WINDOW_SIZE` encoded visual frames, and it queries once at the end. No KV cache is retained. |
-| `ssm` | `qwen_vsr_sliding_window_ssm` | SimpleStream encoded sliding window plus V-Mamba-style 4-direction CSMS SSM. Encoded frames evicted from the window are absorbed into SSM memory. Final query uses the current encoded window and SSM fusion. |
+| `sw` | `qwen_vsr_sliding_window` | SimpleStream-style frame streaming. The model keeps only the latest `SENSORY_WINDOW_SIZE` raw frames and queries once at the end. No KV cache is retained. |
+| `ssm` | `qwen_vsr_sliding_window_ssm` | KV-CSMS streaming. Each frame is prefetched through Qwen2.5-VL to produce decoder KV; visual KV outside the recent frame window is reshaped to its frame H x W grid and absorbed by 4-direction SSM hidden states. Final query uses the current KV window and SSM fusion. |
 
 ## Kept Runtime Scope
 
@@ -16,7 +16,7 @@ This repository is trimmed to the files needed for Qwen2.5-VL VSR evaluation wit
 - `lmms-eval/scripts/vsr_chunk_settings.sh`: shared chunk defaults sourced by the launcher.
 - `lmms-eval/scripts/prepare_vsr_chunks.py`: optional pre-chunk helper.
 - `lmms-eval/lmms_eval/models/simple/qwen_vsr_sliding_window.py`: clean SimpleStream sliding-window baseline.
-- `lmms-eval/lmms_eval/models/simple/qwen_vsr_sliding_window_ssm.py`: SimpleStream + CSMS SSM evaluation path.
+- `lmms-eval/lmms_eval/models/simple/qwen_vsr_sliding_window_ssm.py`: KV-CSMS SSM evaluation path.
 - `lmms-eval/lmms_eval/models/model_utils/qwen_ssm_patch.py`: SSM fusion patch and 4-direction hidden-latent compressor.
 - `lmms-eval/lmms_eval/models/model_utils/csm_triton.py`: VMamba CrossScan/CrossMerge Triton operators used by CSMS.
 - `lmms-eval/lmms_eval/models/model_utils/qwen_chunk_utils.py`: robust video chunk materialization.
@@ -79,18 +79,17 @@ The following records come from:
 
 Only complete runs with `samples=60` and `exit_status=0` are listed. Incomplete `samples=0` runs are ignored.
 
-| Mode | run_id | Samples | Overall(%) | Total time(s) | sec/sample | Throughput(samples/s) | Peak single-GPU memory(GiB) | Avg per-GPU peak memory(GiB) | 8-GPU peak sum(GiB) | Avg GPU util(%) |
-| ---- | ------ | ------- | ---------- | ------------- | ---------- | --------------------- | --------------------------- | ---------------------------- | ------------------- | --------------- |
-| `vl` | `20260714_144732` | 60 | 26.667 | 2061 | 34.350 | 0.029112 | 41.868 | 30.800 | 246.403 | 60.01 |
-| `sw` | `20260714_172805` | 60 | 21.667 | 1118 | 18.633 | 0.053667 | 43.778 | 26.217 | 209.736 | 49.61 |
-| `ssm` | `20260714_185813` | 60 | 18.333 | 1775 | 29.583 | 0.033803 | 39.513 | 28.223 | 225.785 | 33.75 |
+| Mode | run_id | Samples | Total time(s) | sec/sample | Throughput(samples/s) | Peak single-GPU memory(GiB) | Avg per-GPU peak memory(GiB) | 8-GPU peak sum(GiB) | Avg GPU util(%) |
+| ---- | ------ | ------- | ------------- | ---------- | --------------------- | --------------------------- | ---------------------------- | ------------------- | --------------- |
+| `vl` | `20260714_144732` | 60 | 2061 | 34.350 | 0.029112 | 41.868 | 30.800 | 246.403 | 60.01 |
+| `sw` | `20260714_172805` | 60 | 1118 | 18.633 | 0.053667 | 43.778 | 26.217 | 209.736 | 49.61 |
+| `ssm` | `20260714_185813` | 60 | 1775 | 29.583 | 0.033803 | 39.513 | 28.223 | 225.785 | 33.75 |
 
 Metric meanings:
 
 - `Total time(s)`: wall-clock runtime from `summary.txt`.
 - `sec/sample`: `Total time / Samples`.
 - `Throughput(samples/s)`: `Samples / Total time`.
-- `Overall(%)`: VSR exact-match score reported by lmms-eval.
 - `Peak single-GPU memory(GiB)`: maximum observed `memory.used` across all GPUs.
 - `Avg per-GPU peak memory(GiB)`: average of each GPU's own peak memory.
 - `8-GPU peak sum(GiB)`: sum of per-GPU peak memory values.

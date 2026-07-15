@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 import time
 from collections import deque
-from dataclasses import dataclass
 from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
@@ -40,14 +39,6 @@ except ImportError:
 
 
 LOG_PREFIX = "qwen_vsr_sw"
-
-
-@dataclass
-class EncodedFrame:
-    vision_emb: torch.Tensor
-    grid_thw: torch.Tensor
-    frame_index: int
-    chunk_index: int
 
 
 @register_model("qwen_vsr_sliding_window")
@@ -144,7 +135,7 @@ class Qwen_VSR_SlidingWindow(lmms):
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
 
-        self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(pretrained, **model_kwargs).eval()
+        self._model = self._load_pretrained_model(pretrained, model_kwargs).eval()
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
         self.max_num_frames = int(video_max_frames)
@@ -203,6 +194,9 @@ class Qwen_VSR_SlidingWindow(lmms):
         else:
             self._rank = 0
             self._world_size = 1
+
+    def _load_pretrained_model(self, pretrained: str, model_kwargs: dict):
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
 
     @property
     def config(self):
@@ -342,156 +336,21 @@ class Qwen_VSR_SlidingWindow(lmms):
 
         return list(range(total_frames))
 
-    def _special_token_id(self, token: str, fallback: Optional[int] = None) -> int:
-        token_id = self.tokenizer.convert_tokens_to_ids(token)
-        if token_id is None or token_id == self.tokenizer.unk_token_id:
-            if fallback is None:
-                raise ValueError(f"Failed to resolve special token id for {token}")
-            return int(fallback)
-        return int(token_id)
-
-    def _get_text_embedding_layer(self):
-        text_model = getattr(self.model, "model", self.model)
-        if hasattr(text_model, "embed_tokens"):
-            return text_model.embed_tokens
-        return self.model.get_input_embeddings()
-
-    @torch.inference_mode()
-    def _encode_vision_frames(self, frames: List[Image.Image]) -> EncodedFrame:
-        if not frames:
-            raise ValueError("_encode_vision_frames requires at least one frame")
-
-        batch = self.processor(
-            text=[""],
-            images=[frame.convert("RGB") for frame in frames],
-            padding=True,
-            return_tensors="pt",
-        )
-        pixel_values = batch["pixel_values"].to(self.device, dtype=self.model.visual.dtype)
-        image_grid_thw = batch["image_grid_thw"].to(self.device)
-        image_embeds = self.model.visual(pixel_values, grid_thw=image_grid_thw)
-        encoded = EncodedFrame(
-            vision_emb=image_embeds.detach(),
-            grid_thw=image_grid_thw.detach(),
-            frame_index=-1,
-            chunk_index=-1,
-        )
-        del batch, pixel_values, image_grid_thw, image_embeds
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return encoded
-
-    def _combine_encoded_window(self, encoded_window: List[EncodedFrame]):
-        combined_embeds = torch.cat([item.vision_emb.to(self.device) for item in encoded_window], dim=0)
-        combined_grid_thw = torch.cat([item.grid_thw.to(self.device) for item in encoded_window], dim=0)
-        return combined_embeds, combined_grid_thw
-
-    def _build_cached_vision_input_ids(self, context: str, num_vision_tokens: int) -> torch.Tensor:
-        im_start_id = self._special_token_id("<|im_start|>", 151644)
-        im_end_id = self._special_token_id("<|im_end|>", 151645)
-        vision_start_id = self._special_token_id("<|vision_start|>", getattr(self.model.config, "vision_start_token_id", 151652))
-        vision_end_id = self._special_token_id("<|vision_end|>", getattr(self.model.config, "vision_end_token_id", 151653))
-        image_token_id = int(getattr(self.model.config, "image_token_id", 151655))
-
-        input_ids_list: List[int] = []
-        if self.system_prompt:
-            input_ids_list.append(im_start_id)
-            input_ids_list.extend(self.tokenizer.encode("system\n", add_special_tokens=False))
-            input_ids_list.extend(self.tokenizer.encode(self.system_prompt, add_special_tokens=False))
-            input_ids_list.append(im_end_id)
-            input_ids_list.extend(self.tokenizer.encode("\n", add_special_tokens=False))
-
-        input_ids_list.append(im_start_id)
-        input_ids_list.extend(self.tokenizer.encode("user\n", add_special_tokens=False))
-        input_ids_list.append(vision_start_id)
-        input_ids_list.extend([image_token_id] * int(num_vision_tokens))
-        input_ids_list.append(vision_end_id)
-        input_ids_list.extend(self.tokenizer.encode("\n", add_special_tokens=False))
-        input_ids_list.extend(self.tokenizer.encode(context, add_special_tokens=False))
-        input_ids_list.append(im_end_id)
-        input_ids_list.extend(self.tokenizer.encode("\n", add_special_tokens=False))
-        input_ids_list.append(im_start_id)
-        input_ids_list.extend(self.tokenizer.encode("assistant\n", add_special_tokens=False))
-        return torch.tensor([input_ids_list], dtype=torch.long, device=self.device)
-
-    def _get_rope_index_for_cached_vision(self, input_ids, image_grid_thw, attention_mask):
-        try:
-            position_ids, rope_deltas = self.model.get_rope_index(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=None,
-                attention_mask=attention_mask,
-            )
-        except TypeError:
-            try:
-                position_ids, rope_deltas = self.model.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    None,
-                    None,
-                    attention_mask,
-                )
-            except TypeError:
-                position_ids, rope_deltas = self.model.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    None,
-                    attention_mask,
-                )
-        self.model.rope_deltas = rope_deltas
-        return position_ids
-
-    @torch.inference_mode()
-    def _generate_with_cached_vision(self, context: str, cached_embeds: torch.Tensor, cached_grid_thw: torch.Tensor, current_gen_kwargs: dict) -> str:
-        if cached_embeds.numel() == 0:
-            return ""
-
-        input_ids = self._build_cached_vision_input_ids(context, int(cached_embeds.shape[0]))
-        attention_mask = torch.ones_like(input_ids)
-        embed_layer = self._get_text_embedding_layer()
-        inputs_embeds = embed_layer(input_ids)
-
-        image_token_id = int(getattr(self.model.config, "image_token_id", 151655))
-        image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-        expected = int(image_mask[..., 0].sum().item())
-        if expected != int(cached_embeds.shape[0]):
-            raise ValueError(f"cached vision token count mismatch: prompt={expected} cached={cached_embeds.shape[0]}")
-        inputs_embeds = inputs_embeds.masked_scatter(
-            image_mask,
-            cached_embeds.to(inputs_embeds.device, inputs_embeds.dtype),
-        )
-        position_ids = self._get_rope_index_for_cached_vision(input_ids, cached_grid_thw.to(inputs_embeds.device), attention_mask)
-
-        cont = self.model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-            do_sample=current_gen_kwargs["do_sample"],
-            temperature=current_gen_kwargs["temperature"],
-            top_p=current_gen_kwargs["top_p"],
-            num_beams=current_gen_kwargs["num_beams"],
-            max_new_tokens=current_gen_kwargs["max_new_tokens"],
-            use_cache=self.use_cache,
-        )
-
-        prompt_len = int(input_ids.shape[1])
-        if cont.shape[1] > prompt_len:
-            cont = cont[:, prompt_len:]
-        return self.processor.batch_decode(cont, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-
-    def _generate_with_encoded_window(self, context: str, encoded_window: List[EncodedFrame], current_gen_kwargs: dict) -> str:
-        if not encoded_window:
-            return ""
-        cached_embeds, cached_grid_thw = self._combine_encoded_window(encoded_window)
-        return self._generate_with_cached_vision(context, cached_embeds, cached_grid_thw, current_gen_kwargs)
-
     def _generate_with_recent_frames(self, context: str, recent_frames: List[Image.Image], current_gen_kwargs: dict) -> str:
         if not recent_frames:
             return ""
-        encoded = self._encode_vision_frames(recent_frames)
-        return self._generate_with_cached_vision(context, encoded.vision_emb, encoded.grid_thw, current_gen_kwargs)
+
+        video_visual = {
+            "type": "video",
+            "video": [frame.convert("RGB") for frame in recent_frames],
+            "max_pixels": self.max_pixels,
+            "min_pixels": self.min_pixels,
+        }
+        if self.fps is not None:
+            video_visual["sample_fps"] = float(self.fps)
+
+        message = self._build_message(context, [video_visual])
+        return self._generate_for_messages([message], current_gen_kwargs, debug_label="simplestream_window")[0]
 
     def _run_streaming_video(self, context: str, static_visuals: List[dict], video_paths: List[str], current_gen_kwargs: dict, until: List[str]):
         if static_visuals:
@@ -501,7 +360,7 @@ class Qwen_VSR_SlidingWindow(lmms):
             return ""
 
         window_size = max(1, int(self.sensory_window_size))
-        encoded_window = deque(maxlen=window_size)
+        recent_frames = deque(maxlen=window_size)
         sampled_count = 0
         evicted_frames = 0
         chunk_count = 0
@@ -542,28 +401,24 @@ class Qwen_VSR_SlidingWindow(lmms):
                             Image.Resampling.BICUBIC,
                         )
 
-                encoded_frame = self._encode_vision_frames([frame])
-                encoded_frame.frame_index = int(frame_idx)
-                encoded_frame.chunk_index = int(chunk_idx)
-
-                if len(encoded_window) == window_size:
+                if len(recent_frames) == window_size:
                     evicted_frames += 1
                     chunk_dropped += 1
-                encoded_window.append(encoded_frame)
+                recent_frames.append(frame)
                 sampled_count += 1
                 chunk_sampled += 1
 
             if chunk_sampled > 0:
                 chunk_count += 1
                 eval_logger.info(
-                    f"[{self.log_prefix} chunk] chunk_index={chunk_idx + 1}/{len(video_paths)} chunk_frames={chunk_sampled} kept_frames={len(encoded_window)} dropped_frames={chunk_dropped} queries=0 query_mode=final input_fps={self.fps} window_mode=simplestream_encoded"
+                    f"[{self.log_prefix} chunk] chunk_index={chunk_idx + 1}/{len(video_paths)} chunk_frames={chunk_sampled} kept_frames={len(recent_frames)} dropped_frames={chunk_dropped} queries=0 query_mode=final input_fps={self.fps} window_mode=simplestream_raw_window"
                 )
 
-        if not encoded_window:
+        if not recent_frames:
             return ""
 
         generate_start = time.perf_counter()
-        answer = self._generate_with_encoded_window(context, list(encoded_window), current_gen_kwargs)
+        answer = self._generate_with_recent_frames(context, list(recent_frames), current_gen_kwargs)
         generate_elapsed = time.perf_counter() - generate_start
 
         for term in until:
@@ -571,7 +426,7 @@ class Qwen_VSR_SlidingWindow(lmms):
                 answer = answer.split(term)[0]
 
         eval_logger.info(
-            f"[{self.log_prefix} stream] chunks={chunk_count} sampled_frames={sampled_count} kept_frames={len(encoded_window)} dropped_frames={evicted_frames} queries=1 window_mode=simplestream_encoded generate_s={generate_elapsed:.3f}"
+            f"[{self.log_prefix} stream] chunks={chunk_count} sampled_frames={sampled_count} kept_frames={len(recent_frames)} dropped_frames={evicted_frames} queries=1 window_mode=simplestream_raw_window generate_s={generate_elapsed:.3f}"
         )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
