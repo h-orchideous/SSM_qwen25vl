@@ -141,6 +141,7 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         ssm_prefix_len: Optional[int] = None,
         **kwargs,
     ):
+        kwargs.pop("num_items_in_batch", None)
         if ssm_compressor is None:
             ssm_compressor = getattr(self, "ssm_compressor", None)
 
@@ -173,12 +174,116 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                     ssm_prefix_len=ssm_prefix_len,
                     **kwargs,
                 )
+            if (
+                not args
+                and self.training
+                and kwargs.get("labels", None) is not None
+                and kwargs.get("inputs_embeds", None) is None
+                and kwargs.get("input_ids", None) is not None
+                and (kwargs.get("pixel_values", None) is not None or kwargs.get("pixel_values_videos", None) is not None)
+            ):
+                return self._forward_raw_window_train(**kwargs)
             return super().forward(*args, **kwargs)
         finally:
             self._active_ssm_compressor = previous_compressor
             self._active_ssm_sliding_window = previous_window
             self._active_ssm_prefix_len = previous_prefix_len
             self._active_ssm_trainable_memory = previous_trainable_memory
+
+    def _forward_raw_window_train(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        rope_deltas=None,
+        cache_position=None,
+        second_per_grid_ts=None,
+        **kwargs,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids.device != self.model.embed_tokens.weight.device:
+            input_ids = input_ids.to(self.model.embed_tokens.weight.device)
+        embed_device = input_ids.device
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(embed_device)
+        if image_grid_thw is not None:
+            image_grid_thw = image_grid_thw.to(embed_device)
+        if video_grid_thw is not None:
+            video_grid_thw = video_grid_thw.to(embed_device)
+
+        inputs_embeds = self._build_qwen25vl_inputs_embeds(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+        )
+
+        if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
+            position_ids, rope_deltas = self.get_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                second_per_grid_ts,
+                attention_mask,
+            )
+            self.rope_deltas = rope_deltas
+
+        outputs = self.model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=False if use_cache is None else use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        loss = None
+        logits = None
+        if labels is not None:
+            shift_labels = labels[..., 1:].to(hidden_states.device)
+            valid_mask = shift_labels != -100
+            if bool(valid_mask.any()):
+                selected_hidden = hidden_states[..., :-1, :][valid_mask]
+                selected_logits = self.lm_head(selected_hidden).float()
+                loss = CrossEntropyLoss()(selected_logits, shift_labels[valid_mask])
+            else:
+                loss = hidden_states.sum() * 0.0
+        else:
+            logits = self.lm_head(hidden_states)
+
+        if not return_dict:
+            output = (logits, outputs.past_key_values, outputs.hidden_states, outputs.attentions)
+            return (loss,) + output if loss is not None else output
+
+        return Qwen2_5_VLCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=self.rope_deltas,
+        )
 
     def _maybe_init_generation_frame_window(self, kwargs):
         if self.training:
@@ -304,10 +409,23 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
         return inputs_embeds
 
+    def _visual_requires_grad(self) -> bool:
+        if getattr(self.config, "ssm_freeze_visual", False):
+            return False
+        return any(param.requires_grad for param in self.visual.parameters())
+
+    def _encode_visual(self, pixel_values, grid_thw):
+        if self._visual_requires_grad():
+            return self.visual(pixel_values, grid_thw=grid_thw)
+
+        with torch.no_grad():
+            embeds = self.visual(pixel_values, grid_thw=grid_thw)
+        return embeds.detach()
+
     def _encode_visual_in_chunks(self, pixel_values, grid_thw):
         chunk_size = int(getattr(self.config, "ssm_visual_encode_chunk_size", 1) or 1)
         if grid_thw is None or chunk_size <= 0 or int(grid_thw.shape[0]) <= chunk_size:
-            return self.visual(pixel_values, grid_thw=grid_thw)
+            return self._encode_visual(pixel_values, grid_thw)
 
         embeds = []
         offsets = [0]
@@ -318,7 +436,7 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             end = min(start + chunk_size, int(grid_thw.shape[0]))
             pixel_start = offsets[start]
             pixel_end = offsets[end]
-            embeds.append(self.visual(pixel_values[pixel_start:pixel_end], grid_thw=grid_thw[start:end]))
+            embeds.append(self._encode_visual(pixel_values[pixel_start:pixel_end], grid_thw[start:end]))
         return torch.cat(embeds, dim=0)
 
     @staticmethod
@@ -420,7 +538,7 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             grid = grid.to(embed_device) if hasattr(grid, "to") else grid
             pixels = pixel_values[int(segment["pixel_start"]) : int(segment["pixel_end"])].to(embed_device)
             pixels = pixels.type(self.visual.dtype)
-            image_embeds = self.visual(pixels, grid_thw=grid).to(embed_device, embed_dtype)
+            image_embeds = self._encode_visual(pixels, grid).to(embed_device, embed_dtype)
             local_start = token_start - start
             local_end = token_end - start
             inputs_embeds[:, local_start:local_end, :] = image_embeds[: local_end - local_start].unsqueeze(0)
@@ -433,7 +551,7 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             grid = segment["grid"].to(embed_device)
             pixels = pixel_values_videos[int(segment["pixel_start"]) : int(segment["pixel_end"])].to(embed_device)
             pixels = pixels.type(self.visual.dtype)
-            video_embeds = self.visual(pixels, grid_thw=grid).to(embed_device, embed_dtype)
+            video_embeds = self._encode_visual(pixels, grid).to(embed_device, embed_dtype)
             local_start = token_start - start
             local_end = token_end - start
             inputs_embeds[:, local_start:local_end, :] = video_embeds[: local_end - local_start].unsqueeze(0)
@@ -535,7 +653,10 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
         seq_len = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
         past = past_key_values if past_key_values is not None else DynamicCache()
-        logits_chunks = []
+        logits_chunks = [] if labels is None else None
+        loss_sum = None
+        loss_count = 0
+        loss_fct = CrossEntropyLoss(reduction="sum") if labels is not None else None
         hidden_chunks = [] if output_hidden_states else None
         attn_chunks = [] if output_attentions else None
         frame_spans = self._build_training_frame_spans(
@@ -596,7 +717,30 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                     cache_position=local_cache_position,
                 )
                 past = outputs.past_key_values
-                logits_chunks.append(self.lm_head(outputs.last_hidden_state))
+                logits = self.lm_head(outputs.last_hidden_state)
+                if labels is None:
+                    logits_chunks.append(logits)
+                else:
+                    shift_logits_parts = []
+                    shift_label_parts = []
+                    if end - start > 1:
+                        shift_logits_parts.append(logits[:, :-1, :])
+                        shift_label_parts.append(labels[:, start + 1 : end])
+                    if end < seq_len:
+                        shift_logits_parts.append(logits[:, -1:, :])
+                        shift_label_parts.append(labels[:, end : end + 1])
+
+                    if shift_logits_parts:
+                        chunk_shift_logits = torch.cat(shift_logits_parts, dim=1)
+                        chunk_shift_labels = torch.cat(shift_label_parts, dim=1).to(chunk_shift_logits.device)
+                        valid_count = int((chunk_shift_labels != -100).sum().item())
+                        if valid_count > 0:
+                            chunk_loss = loss_fct(
+                                chunk_shift_logits.float().reshape(-1, self.config.vocab_size),
+                                chunk_shift_labels.reshape(-1),
+                            )
+                            loss_sum = chunk_loss if loss_sum is None else loss_sum + chunk_loss
+                            loss_count += valid_count
                 if output_hidden_states:
                     hidden_chunks.append(outputs.hidden_states)
                 if output_attentions:
@@ -613,16 +757,15 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                     tail_abs_start=tail_abs_start,
                 )
 
-            logits = torch.cat(logits_chunks, dim=1)
             loss = None
             if labels is not None:
-                logits = logits.float()
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
-                loss = CrossEntropyLoss()(
-                    shift_logits.view(-1, self.config.vocab_size),
-                    shift_labels.view(-1),
-                )
+                if loss_sum is None:
+                    loss = self.model.embed_tokens.weight.sum() * 0.0
+                else:
+                    loss = loss_sum / max(1, loss_count)
+                logits = None
+            else:
+                logits = torch.cat(logits_chunks, dim=1)
 
             if not return_dict:
                 output = (logits, past)
@@ -923,13 +1066,16 @@ class Qwen2_5SSMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             return tensor[..., :0, :]
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
 
-    @staticmethod
-    def _video_frame_token_count(grid_thw: torch.Tensor) -> int:
-        return int(grid_thw[1].item() * grid_thw[2].item())
+    def _visual_spatial_merge_area(self) -> int:
+        vision_config = getattr(self.config, "vision_config", None)
+        merge_size = int(getattr(vision_config, "spatial_merge_size", 1) or 1)
+        return max(1, merge_size * merge_size)
 
-    @staticmethod
-    def _image_token_count(grid_thw: torch.Tensor) -> int:
-        return int(grid_thw[0].item() * grid_thw[1].item() * grid_thw[2].item())
+    def _video_frame_token_count(self, grid_thw: torch.Tensor) -> int:
+        return int(grid_thw[1].item() * grid_thw[2].item()) // self._visual_spatial_merge_area()
+
+    def _image_token_count(self, grid_thw: torch.Tensor) -> int:
+        return int(grid_thw[0].item() * grid_thw[1].item() * grid_thw[2].item()) // self._visual_spatial_merge_area()
 
     def _build_training_frame_spans(
         self,

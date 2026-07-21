@@ -67,6 +67,64 @@ KEEP_CHUNKS=0
 
 Environment variables passed on the command line override these defaults.
 
+## Training Module
+
+The training path supports Qwen2.5-VL raw-frame sliding-window SFT. It streams video frames in time order, keeps only the most recent `STREAM_FRAME_WINDOW` frames, drops older raw frames, and computes loss only on assistant answer tokens.
+
+Tracked training files:
+
+- `cambrian/model/language_model/qwen2_5_ssm.py`: Qwen2.5-VL wrapper with raw-window training forward and optional SSM/SW paths.
+- `cambrian/scripts/train_qwen25vl_ssm.py`: JSON/JSONL SFT trainer and frame-streaming data collator.
+- `cambrian/scripts/train_qwen25vl_ssm.sh`: default SW raw-window training launcher.
+- `cambrian/scripts/merge_fsdp_qwen25vl_checkpoint.py`: converts Accelerate FSDP `.distcp` checkpoints into a loadable HuggingFace checkpoint.
+
+Default SW training settings in `train_qwen25vl_ssm.sh`:
+
+```bash
+TRAIN_STAGE=sw
+SSM_SLIDING_WINDOW=0
+SW_RAW_FRAME_WINDOW=100
+STREAM_FRAME_WINDOW=100
+TRAINABLE_MODULES=model,lm_head
+GRADIENT_CHECKPOINTING=true
+```
+
+Example training command:
+
+```bash
+cd /home/ZhangHuayu/Workspace/cambrian-s
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+NCCL_P2P_DISABLE=1 \
+NCCL_IB_DISABLE=1 \
+PYTHON_BIN=/home/ZhangHuayu/miniconda3/envs/cambrians_train/bin/python \
+DATA_PATH=/data1/ZhangHuayu/datasets/VSI-Train-10k/vsi_train_10k.jsonl \
+VIDEO_ROOT=/data1/ZhangHuayu/datasets/VSI-Train-10k \
+OUTPUT_DIR=/home/ZhangHuayu/Workspace/cambrian-s/checkpoints/qwen25vl_sw_raw_window_100_lr5e-6_pix100352 \
+FPS=1 \
+MIN_PIXELS=100352 \
+MAX_PIXELS=100352 \
+LEARNING_RATE=5e-6 \
+LOGGING_STEPS=1 \
+bash cambrian/scripts/train_qwen25vl_ssm.sh
+```
+
+Merge the final FSDP checkpoint for evaluation:
+
+```bash
+PYTHONNOUSERSITE=1 /home/ZhangHuayu/miniconda3/envs/cambrians_train/bin/python \
+  cambrian/scripts/merge_fsdp_qwen25vl_checkpoint.py \
+  --checkpoint_dir /home/ZhangHuayu/Workspace/cambrian-s/checkpoints/qwen25vl_sw_raw_window_100_lr5e-6_pix100352/checkpoint-312 \
+  --output_dir /home/ZhangHuayu/Workspace/cambrian-s/checkpoints/qwen25vl_sw_raw_window_100_lr5e-6_pix100352_hf \
+  --base_model_dir /data1/ZhangHuayu/models/Qwen2.5-VL-7B-Instruct
+```
+
+Current merged training checkpoint for evaluation:
+
+```text
+/data1/ZhangHuayu/models/qwen25vl_sw_raw_window_100_lr5e-6_pix100352_hf
+```
+
 ## Current VSR Efficiency Records
 
 The following records come from:

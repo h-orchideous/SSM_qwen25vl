@@ -3,6 +3,7 @@
 
 import json
 import os
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -50,6 +51,7 @@ class DataArguments:
     max_frames: Optional[int] = field(default=None)
     stream_video_as_images: bool = field(default=True)
     stream_frame_stride: int = field(default=1)
+    stream_frame_window: Optional[int] = field(default=None)
 
 
 @dataclass
@@ -136,28 +138,84 @@ def _resolve_media_paths(messages: Sequence[Dict[str, Any]], image_root: Optiona
     return resolved
 
 
-def _decode_video_frames(video_path: str, frame_stride: int = 1):
+def _select_stream_frame_indices(
+    total_frames: int,
+    frame_stride: int = 1,
+    max_frames: Optional[int] = None,
+    raw_fps: Optional[float] = None,
+    target_fps: Optional[float] = None,
+) -> List[int]:
+    frame_stride = max(1, int(frame_stride))
+    if raw_fps is not None and target_fps is not None and float(raw_fps) > 0 and float(target_fps) > 0:
+        duration = int(total_frames) / float(raw_fps)
+        sample_total = max(1, int(duration * float(target_fps)))
+        sample_total = min(sample_total, int(total_frames))
+        indices = torch.linspace(0, int(total_frames) - 1, steps=sample_total).round().long().tolist()
+    else:
+        indices = list(range(0, int(total_frames), frame_stride))
+    if max_frames is not None and int(max_frames) > 0 and len(indices) > int(max_frames):
+        selected = torch.linspace(0, len(indices) - 1, steps=int(max_frames)).round().long().tolist()
+        indices = [indices[i] for i in selected]
+    return indices
+
+
+def _iter_video_frames(
+    video_path: str,
+    frame_stride: int = 1,
+    max_frames: Optional[int] = None,
+    target_fps: Optional[float] = None,
+):
     from PIL import Image
 
-    frame_stride = max(1, int(frame_stride))
     try:
         from decord import VideoReader, cpu
 
         vr = VideoReader(video_path, ctx=cpu(0))
-        indices = list(range(0, len(vr), frame_stride))
-        return [Image.fromarray(frame.asnumpy()).convert("RGB") for frame in vr.get_batch(indices)]
+        raw_fps = float(vr.get_avg_fps() or 0)
+        indices = _select_stream_frame_indices(
+            len(vr),
+            frame_stride=frame_stride,
+            max_frames=max_frames,
+            raw_fps=raw_fps,
+            target_fps=target_fps,
+        )
+        for index in indices:
+            yield Image.fromarray(vr[int(index)].asnumpy()).convert("RGB")
+        return
     except Exception as decord_exc:
         try:
             import av
 
-            frames = []
             container = av.open(video_path)
+            selected = None
+            try:
+                stream = container.streams.video[0]
+                if stream.frames and int(stream.frames) > 0:
+                    raw_fps = float(stream.average_rate) if stream.average_rate is not None else None
+                    selected = set(
+                        _select_stream_frame_indices(
+                            int(stream.frames),
+                            frame_stride=frame_stride,
+                            max_frames=max_frames,
+                            raw_fps=raw_fps,
+                            target_fps=target_fps,
+                        )
+                    )
+            except Exception:
+                selected = None
+            yielded = 0
             for idx, frame in enumerate(container.decode(video=0)):
-                if idx % frame_stride == 0:
-                    frames.append(frame.to_image().convert("RGB"))
+                if selected is not None:
+                    keep_frame = idx in selected
+                else:
+                    keep_frame = idx % max(1, int(frame_stride)) == 0
+                    if max_frames is not None and int(max_frames) > 0 and yielded >= int(max_frames):
+                        keep_frame = False
+                if keep_frame:
+                    yielded += 1
+                    yield frame.to_image().convert("RGB")
             container.close()
-            if frames:
-                return frames
+            return
         except Exception as av_exc:
             raise RuntimeError(
                 f"Failed to decode streaming video frames: {video_path}; "
@@ -166,7 +224,29 @@ def _decode_video_frames(video_path: str, frame_stride: int = 1):
         raise RuntimeError(f"Failed to decode streaming video frames: {video_path}; decord_err={decord_exc}") from decord_exc
 
 
-def _stream_videos_as_images(messages: Sequence[Dict[str, Any]], frame_stride: int = 1) -> List[Dict[str, Any]]:
+def _decode_video_frames(
+    video_path: str,
+    frame_stride: int = 1,
+    max_frames: Optional[int] = None,
+    target_fps: Optional[float] = None,
+):
+    return list(
+        _iter_video_frames(
+            video_path,
+            frame_stride=frame_stride,
+            max_frames=max_frames,
+            target_fps=target_fps,
+        )
+    )
+
+
+def _stream_videos_as_images(
+    messages: Sequence[Dict[str, Any]],
+    frame_stride: int = 1,
+    max_frames: Optional[int] = None,
+    target_fps: Optional[float] = None,
+    frame_window: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     streamed = []
     for message in messages:
         message = dict(message)
@@ -185,7 +265,25 @@ def _stream_videos_as_images(messages: Sequence[Dict[str, Any]], frame_stride: i
             video_path = item.get("video") or item.get("path")
             if not video_path:
                 continue
-            for frame in _decode_video_frames(video_path, frame_stride=frame_stride):
+            window_size = int(frame_window or 0)
+            if window_size > 0:
+                recent_frames = deque(maxlen=window_size)
+                for frame in _iter_video_frames(
+                    video_path,
+                    frame_stride=frame_stride,
+                    max_frames=None,
+                    target_fps=target_fps,
+                ):
+                    recent_frames.append(frame)
+                frames = list(recent_frames)
+            else:
+                frames = _decode_video_frames(
+                    video_path,
+                    frame_stride=frame_stride,
+                    max_frames=max_frames,
+                    target_fps=target_fps,
+                )
+            for frame in frames:
                 new_content.append({"type": "image", "image": frame})
         message["content"] = new_content
         streamed.append(message)
@@ -194,6 +292,30 @@ def _stream_videos_as_images(messages: Sequence[Dict[str, Any]], frame_stride: i
 
 def _strip_visual_marker(text: str) -> str:
     return str(text).replace("<image>", "").replace("<video>", "").strip()
+
+
+def _strip_visual_markers_from_messages(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    stripped = []
+    for message in messages:
+        message = dict(message)
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = _strip_visual_marker(content)
+        elif isinstance(content, list):
+            new_content = []
+            for item in content:
+                if isinstance(item, dict):
+                    item = dict(item)
+                    if item.get("type") == "text" and "text" in item:
+                        item["text"] = _strip_visual_marker(item["text"])
+                    new_content.append(item)
+                elif isinstance(item, str):
+                    new_content.append(_strip_visual_marker(item))
+                else:
+                    new_content.append(item)
+            message["content"] = new_content
+        stripped.append(message)
+    return stripped
 
 
 def _convert_conversations_record(record: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -279,8 +401,15 @@ class Qwen25VLSsmDataCollator:
         for record in features:
             messages = _messages_from_record(record)
             messages = _resolve_media_paths(messages, self.data_args.image_root, self.data_args.video_root)
+            messages = _strip_visual_markers_from_messages(messages)
             if self.data_args.stream_video_as_images:
-                messages = _stream_videos_as_images(messages, frame_stride=self.data_args.stream_frame_stride)
+                messages = _stream_videos_as_images(
+                    messages,
+                    frame_stride=self.data_args.stream_frame_stride,
+                    max_frames=self.data_args.max_frames,
+                    target_fps=self.data_args.fps,
+                    frame_window=self.data_args.stream_frame_window,
+                )
             batch_messages.append(messages)
             texts.append(self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False))
 
@@ -290,25 +419,28 @@ class Qwen25VLSsmDataCollator:
             else:
                 prompt_lengths.append(None)
 
-        image_inputs, video_inputs = _process_vision(batch_messages) if _contains_vision(batch_messages) else (None, None)
+        has_vision = _contains_vision(batch_messages)
+        image_inputs, video_inputs = _process_vision(batch_messages) if has_vision else (None, None)
 
         processor_kwargs = {
             "text": texts,
             "padding": True,
-            "truncation": True,
-            "max_length": self.data_args.max_length,
+            "truncation": not has_vision,
             "return_tensors": "pt",
         }
+        if not has_vision:
+            processor_kwargs["max_length"] = self.data_args.max_length
         if image_inputs:
             processor_kwargs["images"] = image_inputs
         if video_inputs:
             processor_kwargs["videos"] = video_inputs
         if self.data_args.fps is not None:
             processor_kwargs["fps"] = self.data_args.fps
-        if self.data_args.max_frames is not None:
+        if self.data_args.max_frames is not None and not self.data_args.stream_video_as_images:
             processor_kwargs["max_frames"] = self.data_args.max_frames
 
         batch = self.processor(**processor_kwargs)
+        self._validate_visual_token_counts(batch)
         labels = batch["input_ids"].clone()
         pad_token_id = self.processor.tokenizer.pad_token_id
         if pad_token_id is not None:
@@ -324,16 +456,50 @@ class Qwen25VLSsmDataCollator:
         batch["labels"] = labels
         return batch
 
+    def _validate_visual_token_counts(self, batch) -> None:
+        input_ids = batch.get("input_ids", None)
+        if input_ids is None:
+            return
+        tokenizer = self.processor.tokenizer
+        vision_start_id = getattr(tokenizer, "vision_start_token_id", None)
+        image_token_id = getattr(tokenizer, "image_token_id", None)
+        video_token_id = getattr(tokenizer, "video_token_id", None)
+        if vision_start_id is None:
+            vision_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        if image_token_id is None:
+            image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        if video_token_id is None:
+            video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
+        if vision_start_id is None or image_token_id is None or video_token_id is None:
+            return
+
+        vision_start = input_ids == int(vision_start_id)
+        vision_next = torch.zeros_like(input_ids)
+        vision_next[:, :-1] = torch.where(vision_start[:, :-1], input_ids[:, 1:], vision_next[:, :-1])
+        image_markers = int((vision_next == int(image_token_id)).sum().item())
+        video_markers = int((vision_next == int(video_token_id)).sum().item())
+        image_grids = int(batch["image_grid_thw"].shape[0]) if "image_grid_thw" in batch else 0
+        video_grids = int(batch["video_grid_thw"].shape[0]) if "video_grid_thw" in batch else 0
+        if image_markers != image_grids or video_markers != video_grids:
+            raise ValueError(
+                "Visual token/grid mismatch after processing: "
+                f"image_markers={image_markers}, image_grids={image_grids}, "
+                f"video_markers={video_markers}, video_grids={video_grids}. "
+                "Check for leftover <image>/<video> markers in text."
+            )
+
     def _prompt_length(self, prompt_messages: Sequence[Dict[str, Any]]) -> int:
         prompt_text = self.processor.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
         kwargs = {
             "text": [prompt_text],
             "padding": False,
-            "truncation": True,
-            "max_length": self.data_args.max_length,
             "return_tensors": "pt",
         }
-        if _contains_vision([prompt_messages]):
+        has_vision = _contains_vision([prompt_messages])
+        kwargs["truncation"] = not has_vision
+        if not has_vision:
+            kwargs["max_length"] = self.data_args.max_length
+        if has_vision:
             image_inputs, video_inputs = _process_vision([prompt_messages])
             if image_inputs:
                 kwargs["images"] = image_inputs
@@ -341,7 +507,7 @@ class Qwen25VLSsmDataCollator:
                 kwargs["videos"] = video_inputs
         if self.data_args.fps is not None:
             kwargs["fps"] = self.data_args.fps
-        if self.data_args.max_frames is not None:
+        if self.data_args.max_frames is not None and not self.data_args.stream_video_as_images:
             kwargs["max_frames"] = self.data_args.max_frames
         return int(self.processor(**kwargs)["input_ids"].shape[1])
 
@@ -401,11 +567,23 @@ def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, SSMArguments, TrainingArguments))
     model_args, data_args, ssm_args, training_args = parser.parse_args_into_dataclasses()
 
-    if training_args.gradient_checkpointing:
-        raise ValueError("Disable gradient_checkpointing: SW/SSM training needs use_cache=True to collect evicted KV.")
+    if torch.cuda.device_count() > 1 and int(os.environ.get("WORLD_SIZE", "1")) <= 1:
+        raise RuntimeError(
+            "Detected multiple visible CUDA devices without distributed launch. "
+            "Qwen2.5-VL multimodal batches cannot be trained safely with torch.nn.DataParallel because "
+            "image_grid_thw/video_grid_thw are not batch-aligned tensors. Launch with accelerate/FSDP "
+            "or restrict CUDA_VISIBLE_DEVICES to a single GPU."
+        )
+
     train_stage = ssm_args.train_stage.lower()
     if train_stage not in {"sw", "ssm"}:
         raise ValueError("--train_stage must be 'sw' or 'ssm'")
+    uses_cache_training = int(ssm_args.ssm_sliding_window) > 0
+    if training_args.gradient_checkpointing and uses_cache_training:
+        raise ValueError(
+            "Disable gradient_checkpointing when --ssm_sliding_window > 0: SW/SSM cache training needs use_cache=True. "
+            "For raw-frame-window training, set --ssm_sliding_window 0."
+        )
 
     config = Qwen2_5SSMConfig.from_pretrained(
         model_args.model_name_or_path,
@@ -445,9 +623,10 @@ def main():
         model.ssm_compressor = _build_ssm_compressor(model, ssm_args)
     else:
         model.ssm_compressor = None
-    model.config.use_cache = True
+    model.config.use_cache = not bool(training_args.gradient_checkpointing)
 
     _configure_trainable_parameters(model, model_args, train_stage)
+    model.config.ssm_freeze_visual = not any(param.requires_grad for param in model.visual.parameters())
 
     processor_kwargs = {"trust_remote_code": model_args.trust_remote_code}
     if data_args.min_pixels is not None:
